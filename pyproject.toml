@@ -7,7 +7,7 @@ name = "zoty"
 version = "0.3.0"
 description = "Lightweight Zotero MCP server for AI agent interaction"
 requires-python = ">=3.10"
-dependencies = ["mcp", "bm25s", "pyzotero"]
+dependencies = ["fastmcp==4.0.0b3", "bm25s", "pyzotero"]
 license = "MIT"
 readme = "README.md"
 authors = [{name = "Eric Tramel"}]

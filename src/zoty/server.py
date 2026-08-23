@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP, settings as fastmcp_settings
 
-from zoty import db, connector
+from zoty import connector, db, setup
 
 MCP_SERVER_NAME = "zoty"
 _SEARCH_RESULT_LIMIT_CAP = db._SEARCH_RESULT_LIMIT_CAP
@@ -57,10 +59,10 @@ _SEARCH_LIBRARY_ITEM_TYPE_DESCRIPTION = (
     + "returns no items and a warning."
 )
 
-mcp_server = FastMCP(MCP_SERVER_NAME)
+mcp_server = FastMCP(MCP_SERVER_NAME, version=setup.package_version())
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def search_library(
     query: str,
     collection_key: str = "",
@@ -110,7 +112,7 @@ def search_library(
     )
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def search_within_item(
     item_keys: list[str],
     query: str,
@@ -152,7 +154,7 @@ def search_within_item(
     )
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def list_collections() -> str:
     """List all Zotero collections with their keys, names, and item counts.
 
@@ -162,7 +164,7 @@ def list_collections() -> str:
     return db.list_collections()
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def list_collection_items(collection_key: str, limit: int = 25) -> str:
     """List items in a specific Zotero collection.
 
@@ -186,7 +188,7 @@ def list_collection_items(collection_key: str, limit: int = 25) -> str:
     return db.list_collection_items(collection_key, limit=limit)
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def get_item(item_key: str = "", item_keys: list[str] | None = None) -> str:
     """Get full metadata for one Zotero item or a batch of items.
 
@@ -216,7 +218,7 @@ def get_item(item_key: str = "", item_keys: list[str] | None = None) -> str:
     return db.get_item(item_key=item_key, item_keys=item_keys)
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def get_bibtex_and_citation_for_items(
     item_key: str | None = None,
     item_keys: list[str] | None = None,
@@ -251,7 +253,7 @@ def get_bibtex_and_citation_for_items(
     )
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def get_recent_items(limit: int = 10) -> str:
     """Get recently added items from the Zotero library, sorted by date added.
 
@@ -273,7 +275,7 @@ def get_recent_items(limit: int = 10) -> str:
     return db.get_recent_items(limit=limit)
 
 
-@mcp_server.tool()
+@mcp_server.tool
 def add_paper(arxiv_id: str = "", doi: str = "", collection_key: str = "") -> str:
     """Add a paper to Zotero by arXiv ID or DOI.
 
@@ -301,8 +303,23 @@ def add_paper(arxiv_id: str = "", doi: str = "", collection_key: str = "") -> st
     return connector.add_paper(arxiv_id=arxiv_id, doi=doi, collection_key=collection_key)
 
 
-def _augment_tool_schemas() -> None:
-    search_tool = mcp_server._tool_manager.get_tool("search_library")
+async def _augment_tool_schemas_async() -> None:
+    tool_functions = (
+        search_library,
+        search_within_item,
+        list_collections,
+        list_collection_items,
+        get_item,
+        get_bibtex_and_citation_for_items,
+        get_recent_items,
+        add_paper,
+    )
+    for function in tool_functions:
+        tool = await mcp_server.get_tool(function.__name__)
+        if tool is not None:
+            tool.description = inspect.getdoc(function) or tool.description
+
+    search_tool = await mcp_server.get_tool("search_library")
     if search_tool is not None:
         search_tool.description = (
             f"{search_tool.description}\n\n"
@@ -321,7 +338,7 @@ def _augment_tool_schemas() -> None:
         )
 
     for tool_name in ("list_collection_items", "get_recent_items"):
-        tool = mcp_server._tool_manager.get_tool(tool_name)
+        tool = await mcp_server.get_tool(tool_name)
         if tool is None:
             continue
         properties = tool.parameters.setdefault("properties", {})
@@ -332,7 +349,7 @@ def _augment_tool_schemas() -> None:
             "The response also reports `total` for the available top-level non-skipped items and `returned_count` for the number actually included under `items`."
         )
 
-    tool = mcp_server._tool_manager.get_tool("get_bibtex_and_citation_for_items")
+    tool = await mcp_server.get_tool("get_bibtex_and_citation_for_items")
     if tool is None:
         return
 
@@ -342,6 +359,11 @@ def _augment_tool_schemas() -> None:
     tool.parameters["properties"]["item_keys"]["description"] = (
         "A list of Zotero item keys for batch export. At least one of `item_key` or `item_keys` must be provided."
     )
+
+
+def _augment_tool_schemas() -> None:
+    """Apply the extra parameter guidance after FastMCP registers the tools."""
+    asyncio.run(_augment_tool_schemas_async())
 
 
 _augment_tool_schemas()
@@ -379,23 +401,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _apply_server_args(args: argparse.Namespace) -> None:
-    if args.host:
-        mcp_server.settings.host = args.host
+def _server_run_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    """Translate CLI transport options to FastMCP v4 run arguments."""
+    if args.transport == "stdio":
+        return {}
+
+    run_kwargs: dict[str, object] = {}
+    if args.host is not None:
+        run_kwargs["host"] = args.host
     if args.port is not None:
-        mcp_server.settings.port = args.port
-    if args.streamable_http_path:
-        mcp_server.settings.streamable_http_path = args.streamable_http_path
-    if args.sse_path:
-        mcp_server.settings.sse_path = args.sse_path
-    if args.message_path:
-        mcp_server.settings.message_path = args.message_path
+        run_kwargs["port"] = args.port
+
+    if args.transport == "streamable-http":
+        # Return ordinary MCP responses immediately instead of waiting for
+        # FastMCP's SSE deferral window. This remains the 2026-07-28
+        # Streamable HTTP transport; it only selects its JSON response form.
+        run_kwargs["json_response"] = True
+        if args.streamable_http_path is not None:
+            run_kwargs["path"] = args.streamable_http_path
+
+    if args.transport == "sse":
+        if args.sse_path is not None:
+            run_kwargs["path"] = args.sse_path
+        if args.message_path is not None:
+            fastmcp_settings.message_path = args.message_path
+
+    return run_kwargs
 
 
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load the active snapshot, queue refresh work, and start MCP."""
     args = _parse_args(argv)
-    _apply_server_args(args)
     db.prepare_search_index()
 
-    mcp_server.run(transport=args.transport)
+    mcp_server.run(transport=args.transport, **_server_run_kwargs(args))

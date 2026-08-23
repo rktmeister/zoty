@@ -15,6 +15,10 @@ MCP server that connects AI agents to your local Zotero library. Provides 8 tool
 - Zotero local API enabled: Zotero Settings > Advanced > Config Editor > set `extensions.zotero.httpServer.localAPI.enabled` to `true`
 - [Zoty Bridge plugin](#zoty-bridge-plugin) installed (for PDF attachment and collection assignment)
 
+This fork pins FastMCP `4.0.0b3`, the beta release that serves the MCP
+2026-07-28 sessionless protocol alongside legacy MCP clients. The exact pin is
+intentional while FastMCP 4 is in beta.
+
 ## Add to Your Agent
 
 ### Claude Code
@@ -53,6 +57,9 @@ Add to your `~/.codex/config.toml`:
 command = "uvx"
 args = ["zoty", "mcp"]
 ```
+
+For one shared server managed by systemd, use the Streamable HTTP URL shown
+below instead of this command-based configuration.
 
 ## Installation
 
@@ -241,6 +248,44 @@ The shared MCP endpoint will be:
 ```text
 http://127.0.0.1:8000/mcp
 ```
+
+### Run the shared server with systemd
+
+The repository includes a user-scoped systemd unit at
+`systemd/zoty-mcp.service`. It runs the fork's synced virtual environment,
+starts one long-lived Streamable HTTP server, and restarts it if it exits.
+
+Prepare the environment and install the unit:
+
+```bash
+uv sync
+mkdir -p ~/.config/systemd/user
+install -m 0644 systemd/zoty-mcp.service ~/.config/systemd/user/zoty-mcp.service
+systemctl --user daemon-reload
+systemctl --user enable --now zoty-mcp.service
+```
+
+Check the service and follow its logs with:
+
+```bash
+systemctl --user status zoty-mcp.service
+journalctl --user -u zoty-mcp.service -f
+```
+
+The unit binds to `127.0.0.1:8000/mcp`. If the service must start before an
+interactive login, enable lingering once for your user with
+`loginctl enable-linger "$USER"`. Keep Zotero running for tool calls that use
+its local API or the zoty-bridge plugin.
+
+Configure Codex and other clients to use the shared URL:
+
+```toml
+[mcp_servers.zoty]
+url = "http://127.0.0.1:8000/mcp"
+```
+
+Do not also configure a command-based `zoty mcp` entry for those clients, or
+they will start additional server processes.
 
 If you want a different endpoint path:
 

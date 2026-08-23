@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from fastmcp import settings as fastmcp_settings
+
 import zoty.server as server
 
 
@@ -18,18 +20,10 @@ def _get_registered_tool(name: str):
 
 class ServerMainTests(unittest.TestCase):
     def setUp(self):
-        self.original_host = server.mcp_server.settings.host
-        self.original_port = server.mcp_server.settings.port
-        self.original_streamable_http_path = server.mcp_server.settings.streamable_http_path
-        self.original_sse_path = server.mcp_server.settings.sse_path
-        self.original_message_path = server.mcp_server.settings.message_path
+        self.original_message_path = fastmcp_settings.message_path
 
     def tearDown(self):
-        server.mcp_server.settings.host = self.original_host
-        server.mcp_server.settings.port = self.original_port
-        server.mcp_server.settings.streamable_http_path = self.original_streamable_http_path
-        server.mcp_server.settings.sse_path = self.original_sse_path
-        server.mcp_server.settings.message_path = self.original_message_path
+        fastmcp_settings.message_path = self.original_message_path
 
     def test_main_applies_http_server_flags(self):
         with (
@@ -50,10 +44,13 @@ class ServerMainTests(unittest.TestCase):
             )
 
         prepare_mock.assert_called_once_with()
-        run_mock.assert_called_once_with(transport="streamable-http")
-        self.assertEqual(server.mcp_server.settings.host, "127.0.0.1")
-        self.assertEqual(server.mcp_server.settings.port, 8765)
-        self.assertEqual(server.mcp_server.settings.streamable_http_path, "/shared-mcp")
+        run_mock.assert_called_once_with(
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=8765,
+            path="/shared-mcp",
+            json_response=True,
+        )
 
     def test_main_applies_sse_paths(self):
         with (
@@ -72,9 +69,11 @@ class ServerMainTests(unittest.TestCase):
             )
 
         prepare_mock.assert_called_once_with()
-        run_mock.assert_called_once_with(transport="sse")
-        self.assertEqual(server.mcp_server.settings.sse_path, "/events")
-        self.assertEqual(server.mcp_server.settings.message_path, "/messages")
+        run_mock.assert_called_once_with(
+            transport="sse",
+            path="/events",
+        )
+        self.assertEqual(fastmcp_settings.message_path, "/messages")
 
 
 class ServerToolTests(unittest.TestCase):
@@ -240,7 +239,7 @@ class ServerToolTests(unittest.TestCase):
         self.assertIn("batch `items` shape", description)
 
     def test_get_bibtex_tool_schema_requires_item_key_or_item_keys(self):
-        schema = _get_registered_tool("get_bibtex_and_citation_for_items").inputSchema
+        schema = _get_registered_tool("get_bibtex_and_citation_for_items").parameters
 
         # anyOf is not allowed at the top level by the Claude API
         self.assertNotIn("anyOf", schema)
@@ -267,9 +266,9 @@ class ServerToolTests(unittest.TestCase):
         self.assertIn("deduplicated match count", description)
 
     def test_limit_parameter_schemas_describe_clamping_and_metadata(self):
-        search_schema = _get_registered_tool("search_library").inputSchema
-        list_schema = _get_registered_tool("list_collection_items").inputSchema
-        recent_schema = _get_registered_tool("get_recent_items").inputSchema
+        search_schema = _get_registered_tool("search_library").parameters
+        list_schema = _get_registered_tool("list_collection_items").parameters
+        recent_schema = _get_registered_tool("get_recent_items").parameters
 
         self.assertIn("Values below 0 are treated as 0, values above 25 are clamped to 25", search_schema["properties"]["limit"]["description"])
         self.assertIn("`requested_limit`, `applied_limit`, `limit_cap`, and `limit_capped`", search_schema["properties"]["limit"]["description"])

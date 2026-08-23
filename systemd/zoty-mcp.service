@@ -1,0 +1,15 @@
+[Unit]
+Description=Zoty MCP server (shared Streamable HTTP endpoint)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tools/zoty
+ExecStart=%h/tools/zoty/.venv/bin/python -m zoty mcp --transport streamable-http --host 127.0.0.1 --port 8000 --streamable-http-path /mcp
+Restart=on-failure
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

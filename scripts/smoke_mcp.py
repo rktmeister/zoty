@@ -2,8 +2,8 @@
 """Local MCP smoke tests against a running Zotero desktop instance.
 
 Design rationale:
-    These checks exercise zoty the way an MCP client does: they launch the
-    server over stdio, perform the MCP initialize/tools handshake, and call the
+    These checks exercise zoty the way a modern MCP client does: they launch the
+    server over stdio, perform the 2026-07-28 discovery/tools handshake, and call the
     tools listed in the README. They are intentionally separate from
     `make test` because they depend on machine-local state: Zotero desktop must
     be running, Zotero's local API must be enabled, the zoty-bridge plugin must
@@ -78,7 +78,9 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
-PROTOCOL_VERSION = "2025-06-18"
+PROTOCOL_VERSION = "2026-07-28"
+CLIENT_INFO = {"name": "zoty-smoke", "version": "0.1"}
+CLIENT_CAPABILITIES: dict[str, Any] = {}
 DEFAULT_TIMEOUT_SECONDS = 45
 SEARCH_RETRY_SECONDS = 120
 TOOLS = [
@@ -103,7 +105,7 @@ class Check:
 class McpClient:
     def __init__(self) -> None:
         self._proc = subprocess.Popen(
-            [sys.executable, "-m", "zoty"],
+            [sys.executable, "-m", "zoty", "mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -139,18 +141,10 @@ class McpClient:
                 raise RuntimeError(f"MCP server exited with {self._proc.returncode}: {stderr}")
         raise TimeoutError(f"Timed out waiting for {method}")
 
-    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            message["params"] = params
-        assert self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(message) + "\n")
-        self._proc.stdin.flush()
-
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
         response = self.request(
             "tools/call",
-            {"name": name, "arguments": arguments or {}},
+            _modern_params({"name": name, "arguments": arguments or {}}),
             timeout=timeout,
         )
         if "error" in response:
@@ -190,6 +184,16 @@ def _env_bool(name: str, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _modern_params(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    modern_params = dict(params or {})
+    modern_params["_meta"] = {
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
+        "io.modelcontextprotocol/clientCapabilities": CLIENT_CAPABILITIES,
+    }
+    return modern_params
 
 
 def _zotero_endpoint_ok(url: str) -> tuple[bool, str]:
@@ -244,20 +248,32 @@ def run() -> int:
 
     client = McpClient()
     try:
-        client.request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "zoty-smoke", "version": "0.1"},
-            },
+        discovery = client.request(
+            "server/discover",
+            _modern_params(),
         )
-        client.notify("notifications/initialized", {})
+        discovery_result = discovery.get("result", {})
+        discovery_meta = discovery_result.get("_meta", {})
+        server_info = discovery_meta.get("io.modelcontextprotocol/serverInfo", {})
+        _append(
+            checks,
+            "server/discover",
+            discovery_result.get("resultType") == "complete"
+            and PROTOCOL_VERSION in discovery_result.get("supportedVersions", [])
+            and bool(server_info.get("name")),
+            f"resultType={discovery_result.get('resultType')} server={server_info.get('name', 'unknown')}",
+        )
 
-        tools_response = client.request("tools/list", {})
-        tool_names = [tool["name"] for tool in tools_response.get("result", {}).get("tools", [])]
+        tools_response = client.request("tools/list", _modern_params())
+        tools_result = tools_response.get("result", {})
+        tool_names = [tool["name"] for tool in tools_result.get("tools", [])]
         missing_tools = [tool for tool in TOOLS if tool not in tool_names]
-        _append(checks, "tools/list", not missing_tools, f"{len(tool_names)} tools; missing={missing_tools}")
+        _append(
+            checks,
+            "tools/list",
+            tools_result.get("resultType") == "complete" and not missing_tools,
+            f"resultType={tools_result.get('resultType')} {len(tool_names)} tools; missing={missing_tools}",
+        )
 
         collections = client.call_tool("list_collections")
         collection_list = collections.get("collections", [])
