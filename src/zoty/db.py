@@ -1,8 +1,7 @@
-"""Zotero local library access and chunked full-text BM25 search."""
+"""Zotero local library access and chunked SQLite full-text search."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
@@ -10,18 +9,15 @@ from datetime import datetime, timezone
 import hashlib
 import html
 import json
-import os
 from pathlib import Path
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 import urllib.parse
 
-import bm25s
 from pyzotero import zotero
 
 from zoty.fulltext_bridge import BridgeError, ensure_parent_fulltext
@@ -31,9 +27,9 @@ _ZOTERO_DIR = Path.home() / "Zotero"
 _ZOTERO_STORAGE = _ZOTERO_DIR / "storage"
 _ZOTERO_DB = _ZOTERO_DIR / "zotero.sqlite"
 _SIDECAR_ROOT = Path.home() / ".cache" / "zoty" / "fulltext-index"
-_SCHEMA_VERSION = "1"
-_CORPUS_METADATA_FILENAME = "corpus-metadata.json"
-_VOCABULARY_DB_FILENAME = "vocabulary.sqlite"
+_SCHEMA_VERSION = "2"
+_FTS_SCHEMA_VERSION = "1"
+_FTS_MIGRATION_BATCH_SIZE = 256
 _SKIP_TYPES = {"attachment", "note", "annotation"}
 _CACHE_CONTENT_TYPES = {
     "application/epub+zip",
@@ -52,6 +48,12 @@ _ITEM_DETAIL_MAX_WORKERS = 4
 _DETAIL_VIEW_MAX_CREATORS = 15
 _BIBTEX_MAX_AUTHORS = 10
 _EMPTY_QUERY_WARNING = "Query produced no searchable terms after stop-word removal. Try more specific keywords."
+_ENGLISH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if",
+    "in", "into", "is", "it", "no", "not", "of", "on", "or", "such", "that",
+    "the", "their", "then", "there", "these", "they", "this", "to", "was",
+    "will", "with",
+}
 _LINK_MODE_LABELS = {
     0: "imported_file",
     1: "imported_url",
@@ -111,99 +113,8 @@ class _AttachmentIngestResult:
 
 @dataclass
 class _SearchState:
-    snapshot_id: str
     source_fingerprint: str
-    retriever: bm25s.BM25 | None
-    corpus_docs: Sequence[dict[str, Any]]
-    parents: dict[str, dict[str, Any]]
-    doc_parent_ids: Sequence[int] = ()
-    doc_parent_keys: Sequence[str] = ()
-
-
-class _ThreadSafeCorpus(Sequence[dict[str, Any]]):
-    """Serialize reads from bm25s's lazy corpus, which shares one mmap cursor."""
-
-    def __init__(self, corpus: Sequence[dict[str, Any]]) -> None:
-        self._corpus = corpus
-        self._lock = threading.Lock()
-
-    def __len__(self) -> int:
-        return len(self._corpus)
-
-    def __getitem__(self, index: Any) -> Any:
-        with self._lock:
-            return self._corpus[index]
-
-    def close(self) -> None:
-        close_corpus = getattr(self._corpus, "close", None)
-        if close_corpus is not None:
-            close_corpus()
-
-
-class _SqliteVocabulary(Mapping[str, int]):
-    """Read token IDs from a compact, immutable SQLite database."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._lock = threading.Lock()
-        self._cache: dict[str, int | None] = {}
-        self._connection: sqlite3.Connection | None = None
-        self._connection = sqlite3.connect(
-            f"file:{path}?mode=ro&immutable=1",
-            uri=True,
-            check_same_thread=False,
-        )
-        self._length = int(
-            self._connection.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
-        )
-
-    def _lookup(self, token: str) -> int | None:
-        with self._lock:
-            if token in self._cache:
-                return self._cache[token]
-            if self._connection is None:
-                raise RuntimeError("vocabulary database is closed")
-            row = self._connection.execute(
-                "SELECT token_id FROM vocabulary WHERE token = ?",
-                (token,),
-            ).fetchone()
-            token_id = int(row[0]) if row is not None else None
-            if len(self._cache) >= 4096:
-                self._cache.clear()
-            self._cache[token] = token_id
-            return token_id
-
-    def __getitem__(self, token: str) -> int:
-        token_id = self._lookup(token)
-        if token_id is None:
-            raise KeyError(token)
-        return token_id
-
-    def __contains__(self, token: object) -> bool:
-        return isinstance(token, str) and self._lookup(token) is not None
-
-    def __iter__(self):
-        with closing(
-            sqlite3.connect(f"file:{self._path}?mode=ro&immutable=1", uri=True)
-        ) as conn:
-            for row in conn.execute("SELECT token FROM vocabulary ORDER BY token"):
-                yield str(row[0])
-
-    def __len__(self) -> int:
-        return self._length
-
-    def close(self) -> None:
-        with self._lock:
-            if self._connection is not None:
-                self._connection.close()
-                self._connection = None
-            self._cache.clear()
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
+    document_count: int
 
 
 _index_lock = threading.Lock()
@@ -216,10 +127,6 @@ _zot: zotero.Zotero | None = None
 
 def _manifest_db_path() -> Path:
     return _SIDECAR_ROOT / "manifest.sqlite"
-
-
-def _snapshots_dir() -> Path:
-    return _SIDECAR_ROOT / "snapshots"
 
 
 def _get_zot() -> zotero.Zotero:
@@ -908,7 +815,7 @@ def _fetch_item_exports(
 
 
 def _ensure_sidecar_layout() -> None:
-    _snapshots_dir().mkdir(parents=True, exist_ok=True)
+    _SIDECAR_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _connect_manifest(*, writable: bool = False) -> sqlite3.Connection:
@@ -916,13 +823,17 @@ def _connect_manifest(*, writable: bool = False) -> sqlite3.Connection:
     path = _manifest_db_path()
     if writable:
         conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
     else:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _initialize_manifest(conn: sqlite3.Connection) -> None:
+def _initialize_manifest(conn: sqlite3.Connection) -> int:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS meta (
@@ -994,6 +905,83 @@ def _initialize_manifest(conn: sqlite3.Connection) -> None:
         (_SCHEMA_VERSION,),
     )
     conn.commit()
+    return _initialize_fts_index(conn)
+
+
+def _fts_table_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'docs_fts'",
+    ).fetchone()
+    return row is not None
+
+
+def _create_fts_objects(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute(
+            """CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+                   text,
+                   content = 'docs',
+                   content_rowid = 'rowid',
+                   tokenize = "unicode61 remove_diacritics 0 tokenchars '_'"
+               )"""
+        )
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "SQLite FTS5 support is required for Zotero full-text search"
+        ) from exc
+
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS docs_fts_after_insert
+        AFTER INSERT ON docs BEGIN
+            INSERT INTO docs_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS docs_fts_after_delete
+        AFTER DELETE ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS docs_fts_after_update
+        AFTER UPDATE OF text ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO docs_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        """
+    )
+
+
+def _initialize_fts_index(conn: sqlite3.Connection) -> int:
+    """Create and, when needed, populate the FTS index in bounded batches."""
+    table_existed = _fts_table_exists(conn)
+    _create_fts_objects(conn)
+    if table_existed and _get_meta(conn, "fts_schema_version") == _FTS_SCHEMA_VERSION:
+        return 0
+
+    _set_meta(conn, "fts_index_status", "building")
+    conn.commit()
+    conn.execute("INSERT INTO docs_fts(docs_fts) VALUES ('delete-all')")
+    conn.commit()
+
+    indexed_count = 0
+    cursor = conn.execute("SELECT rowid, text FROM docs ORDER BY rowid")
+    while rows := cursor.fetchmany(_FTS_MIGRATION_BATCH_SIZE):
+        conn.executemany(
+            "INSERT INTO docs_fts(rowid, text) VALUES (?, ?)",
+            ((row["rowid"], row["text"]) for row in rows),
+        )
+        conn.commit()
+        indexed_count += len(rows)
+
+    conn.execute(
+        "INSERT INTO docs_fts(docs_fts, rank) VALUES ('integrity-check', 1)"
+    )
+    _set_meta(conn, "fts_schema_version", _FTS_SCHEMA_VERSION)
+    _set_meta(conn, "fts_index_status", "ready")
+    conn.commit()
+    return indexed_count
 
 
 def _get_meta(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -1544,10 +1532,20 @@ def _upsert_attachment(
 
 def _insert_doc(conn: sqlite3.Connection, doc: dict[str, Any]) -> None:
     conn.execute(
-        """INSERT OR REPLACE INTO docs(
+        """INSERT INTO docs(
                doc_id, parent_key, attachment_key, doc_kind, chunk_index,
                char_start, char_end, token_count, text, text_hash
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(doc_id) DO UPDATE SET
+               parent_key = excluded.parent_key,
+               attachment_key = excluded.attachment_key,
+               doc_kind = excluded.doc_kind,
+               chunk_index = excluded.chunk_index,
+               char_start = excluded.char_start,
+               char_end = excluded.char_end,
+               token_count = excluded.token_count,
+               text = excluded.text,
+               text_hash = excluded.text_hash""",
         (
             doc["doc_id"],
             doc["parent_key"],
@@ -1567,7 +1565,7 @@ def _refresh_docs_manifest(
     conn: sqlite3.Connection,
     parents: dict[str, _ParentRecord],
     attachments: dict[str, _AttachmentRecord],
-) -> None:
+) -> int:
     existing_parent_hashes = {
         row["parent_key"]: row["metadata_hash"]
         for row in conn.execute("SELECT parent_key, metadata_hash FROM parents")
@@ -1585,9 +1583,17 @@ def _refresh_docs_manifest(
     current_attachment_keys = set(attachments)
     manifest_parent_keys = set(existing_parent_hashes)
     manifest_attachment_keys = set(existing_attachment_rows)
+    changed_doc_ids: set[str] = set()
 
     removed_attachments = manifest_attachment_keys - current_attachment_keys
     if removed_attachments:
+        changed_doc_ids.update(
+            row["doc_id"]
+            for row in conn.execute(
+                f"SELECT doc_id FROM docs WHERE attachment_key IN ({','.join('?' for _ in removed_attachments)})",
+                tuple(sorted(removed_attachments)),
+            )
+        )
         conn.executemany(
             "DELETE FROM docs WHERE attachment_key = ?",
             [(key,) for key in sorted(removed_attachments)],
@@ -1599,6 +1605,13 @@ def _refresh_docs_manifest(
 
     removed_parents = manifest_parent_keys - current_parent_keys
     if removed_parents:
+        changed_doc_ids.update(
+            row["doc_id"]
+            for row in conn.execute(
+                f"SELECT doc_id FROM docs WHERE parent_key IN ({','.join('?' for _ in removed_parents)})",
+                tuple(sorted(removed_parents)),
+            )
+        )
         conn.executemany(
             "DELETE FROM docs WHERE parent_key = ?",
             [(key,) for key in sorted(removed_parents)],
@@ -1616,7 +1629,9 @@ def _refresh_docs_manifest(
         previous_hash = existing_parent_hashes.get(parent.parent_key)
         _upsert_parent(conn, parent)
         if previous_hash != parent.metadata_hash:
-            conn.execute("DELETE FROM docs WHERE doc_id = ?", (f"meta:{parent.parent_key}",))
+            doc_id = f"meta:{parent.parent_key}"
+            changed_doc_ids.add(doc_id)
+            conn.execute("DELETE FROM docs WHERE doc_id = ?", (doc_id,))
             metadata_doc = _build_metadata_doc(parent)
             if metadata_doc:
                 _insert_doc(conn, metadata_doc)
@@ -1625,6 +1640,13 @@ def _refresh_docs_manifest(
         existing_row = existing_attachment_rows.get(attachment.attachment_key)
         if existing_row is None or existing_row["source_signature"] != attachment.source_signature:
             ingested = _ingest_attachment(attachment)
+            changed_doc_ids.update(
+                row["doc_id"]
+                for row in conn.execute(
+                    "SELECT doc_id FROM docs WHERE attachment_key = ?",
+                    (attachment.attachment_key,),
+                )
+            )
             conn.execute(
                 "DELETE FROM docs WHERE attachment_key = ?",
                 (attachment.attachment_key,),
@@ -1642,6 +1664,7 @@ def _refresh_docs_manifest(
             )
             for doc in ingested.docs:
                 _insert_doc(conn, doc)
+                changed_doc_ids.add(doc["doc_id"])
             continue
 
         _upsert_attachment(
@@ -1656,280 +1679,7 @@ def _refresh_docs_manifest(
             error_text=existing_row["error_text"],
         )
 
-
-def _load_docs_for_snapshot(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    docs = []
-    for row in conn.execute(
-        """SELECT doc_id, parent_key, attachment_key, doc_kind, chunk_index,
-                  char_start, char_end, token_count, text, text_hash
-           FROM docs
-           ORDER BY doc_id ASC"""
-    ):
-        docs.append({
-            "doc_id": row["doc_id"],
-            "parent_key": row["parent_key"],
-            "attachment_key": row["attachment_key"],
-            "doc_kind": row["doc_kind"],
-            "chunk_index": int(row["chunk_index"]),
-            "char_start": int(row["char_start"]),
-            "char_end": int(row["char_end"]),
-            "token_count": int(row["token_count"]),
-            "text": row["text"],
-            "text_hash": row["text_hash"],
-        })
-    return docs
-
-
-def _collect_corpus_parent_metadata(
-    docs: Iterable[dict[str, Any]],
-) -> tuple[list[str], list[int]]:
-    parent_keys: list[str] = []
-    parent_id_by_key: dict[str, int] = {}
-    doc_parent_ids: list[int] = []
-    for doc in docs:
-        parent_key = str(doc.get("parent_key", ""))
-        if not parent_key:
-            raise ValueError("ranked document is missing parent_key")
-        parent_id = parent_id_by_key.get(parent_key)
-        if parent_id is None:
-            parent_id = len(parent_keys)
-            parent_id_by_key[parent_key] = parent_id
-            parent_keys.append(parent_key)
-        doc_parent_ids.append(parent_id)
-    return parent_keys, doc_parent_ids
-
-
-def _write_corpus_parent_metadata(
-    snapshot_dir: Path,
-    docs: Iterable[dict[str, Any]],
-) -> None:
-    target_path = snapshot_dir / _CORPUS_METADATA_FILENAME
-    if target_path.exists():
-        return
-    parent_keys, doc_parent_ids = _collect_corpus_parent_metadata(docs)
-    temp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
-    try:
-        temp_path.write_text(
-            json.dumps(
-                {
-                    "doc_parent_ids": doc_parent_ids,
-                    "parent_keys": parent_keys,
-                    "version": 1,
-                },
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
-        )
-        temp_path.replace(target_path)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-
-
-def _iter_json_object_items(path: Path) -> Iterator[tuple[str, int]]:
-    """Read a string-to-integer JSON object without loading the whole file."""
-    decoder = json.JSONDecoder()
-    chunk_size = 1024 * 1024
-
-    with path.open(encoding="utf-8") as source:
-        buffer = ""
-        position = 0
-        eof = False
-
-        def refill() -> None:
-            nonlocal buffer, position, eof
-            chunk = source.read(chunk_size)
-            buffer = buffer[position:] + chunk
-            position = 0
-            eof = not chunk
-
-        def skip_whitespace() -> None:
-            nonlocal position
-            while True:
-                while position < len(buffer) and buffer[position].isspace():
-                    position += 1
-                if position < len(buffer) or eof:
-                    return
-                refill()
-
-        def decode_value() -> Any:
-            nonlocal position
-            while True:
-                skip_whitespace()
-                start = position
-                try:
-                    value, end = decoder.raw_decode(buffer, position)
-                except json.JSONDecodeError as exc:
-                    if eof:
-                        raise ValueError(f"invalid JSON object in {path}") from exc
-                    refill()
-                    continue
-                if end == len(buffer) and not eof:
-                    position = start
-                    refill()
-                    continue
-                position = end
-                return value
-
-        refill()
-        skip_whitespace()
-        if position >= len(buffer) or buffer[position] != "{":
-            raise ValueError(f"expected a JSON object in {path}")
-        position += 1
-
-        skip_whitespace()
-        if position < len(buffer) and buffer[position] == "}":
-            position += 1
-        else:
-            while True:
-                token = decode_value()
-                if not isinstance(token, str):
-                    raise ValueError(f"JSON object key is not a string in {path}")
-
-                skip_whitespace()
-                if position >= len(buffer) or buffer[position] != ":":
-                    raise ValueError(f"expected ':' after a JSON object key in {path}")
-                position += 1
-
-                token_id = decode_value()
-                if not isinstance(token_id, int) or isinstance(token_id, bool):
-                    raise ValueError(f"JSON object value is not an integer in {path}")
-                yield token, token_id
-
-                skip_whitespace()
-                if position >= len(buffer):
-                    raise ValueError(f"unterminated JSON object in {path}")
-                delimiter = buffer[position]
-                position += 1
-                if delimiter == "}":
-                    break
-                if delimiter != ",":
-                    raise ValueError(f"expected ',' or '}}' in {path}")
-
-        skip_whitespace()
-        if position < len(buffer):
-            raise ValueError(f"unexpected content after JSON object in {path}")
-
-
-def _build_compact_vocabulary(
-    bm25_dir: Path,
-    vocabulary: Mapping[str, int] | None = None,
-) -> None:
-    target_path = bm25_dir / _VOCABULARY_DB_FILENAME
-    if target_path.exists():
-        return
-    source_path = bm25_dir / "vocab.index.json"
-    if not source_path.exists():
-        raise FileNotFoundError(f"BM25 vocabulary was not found at {source_path}")
-
-    temp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
-    temp_path.unlink(missing_ok=True)
-    try:
-        with closing(sqlite3.connect(temp_path)) as conn:
-            conn.execute("PRAGMA journal_mode = OFF")
-            conn.execute("PRAGMA synchronous = OFF")
-            conn.execute("PRAGMA cache_size = -32768")
-            conn.execute("PRAGMA temp_store = FILE")
-            conn.execute(
-                """CREATE TABLE vocabulary (
-                       token TEXT PRIMARY KEY,
-                       token_id INTEGER NOT NULL
-                   ) WITHOUT ROWID"""
-            )
-            if vocabulary is None:
-                conn.executemany(
-                    "INSERT INTO vocabulary(token, token_id) VALUES (?, ?)",
-                    _iter_json_object_items(source_path),
-                )
-            else:
-                sorted_tokens = sorted(vocabulary)
-                conn.executemany(
-                    "INSERT INTO vocabulary(token, token_id) VALUES (?, ?)",
-                    ((token, vocabulary[token]) for token in sorted_tokens),
-                )
-            conn.commit()
-        temp_path.replace(target_path)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-
-
-def prepare_snapshot_for_low_memory(snapshot_dir: Path) -> None:
-    """Create compact lookup files for a snapshot built by an older Zoty."""
-    bm25_dir = snapshot_dir / "bm25"
-    if not bm25_dir.exists():
-        return
-    _build_compact_vocabulary(bm25_dir)
-
-    metadata_path = snapshot_dir / _CORPUS_METADATA_FILENAME
-    if metadata_path.exists():
-        return
-    corpus_path = bm25_dir / "corpus.jsonl"
-    if not corpus_path.exists():
-        raise FileNotFoundError(f"BM25 corpus was not found at {corpus_path}")
-    with corpus_path.open(encoding="utf-8") as corpus_file:
-        docs = (json.loads(line) for line in corpus_file if line.strip())
-        _write_corpus_parent_metadata(snapshot_dir, docs)
-
-
-def _build_snapshot(
-    docs: list[dict[str, Any]],
-    *,
-    source_fingerprint: str,
-    parent_count: int,
-    attachment_count: int,
-) -> tuple[str, int]:
-    snapshot_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-    snapshot_dir = _snapshots_dir() / snapshot_id
-    temp_dir = _snapshots_dir() / f".{snapshot_id}.tmp"
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        retriever: bm25s.BM25 | None = None
-        indexed_docs: list[dict[str, Any]] = []
-        if docs:
-            token_lists = bm25s.tokenize(
-                [doc["text"] for doc in docs],
-                stopwords="en",
-                show_progress=False,
-                return_ids=False,
-            )
-            indexed_docs = [
-                doc
-                for doc, tokens in zip(docs, token_lists, strict=False)
-                if tokens
-            ]
-            indexed_tokens = [tokens for tokens in token_lists if tokens]
-            if indexed_tokens:
-                retriever = bm25s.BM25()
-                retriever.index(indexed_tokens, show_progress=False)
-                retriever.save(temp_dir / "bm25", corpus=indexed_docs)
-                _build_compact_vocabulary(
-                    temp_dir / "bm25",
-                    vocabulary=retriever.vocab_dict,
-                )
-                _write_corpus_parent_metadata(temp_dir, indexed_docs)
-
-        snapshot_meta = {
-            "attachment_count": attachment_count,
-            "built_at": _now_iso(),
-            "doc_count": len(docs),
-            "parent_count": parent_count,
-            "snapshot_id": snapshot_id,
-            "source_fingerprint": source_fingerprint,
-        }
-        (temp_dir / "snapshot.json").write_text(
-            json.dumps(snapshot_meta, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temp_dir.replace(snapshot_dir)
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
-
-    return snapshot_id, len(indexed_docs)
+    return len(changed_doc_ids)
 
 
 def _load_parent_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -1956,133 +1706,25 @@ def _load_parent_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     return parents
 
 
-def _snapshot_needs_low_memory_artifacts(snapshot_dir: Path) -> bool:
-    bm25_dir = snapshot_dir / "bm25"
-    return bm25_dir.exists() and (
-        not (bm25_dir / _VOCABULARY_DB_FILENAME).exists()
-        or not (snapshot_dir / _CORPUS_METADATA_FILENAME).exists()
-    )
-
-
-def _ensure_snapshot_low_memory_artifacts(snapshot_dir: Path) -> None:
-    if not _snapshot_needs_low_memory_artifacts(snapshot_dir):
-        return
-    return_code = _run_snapshot_prepare_worker_process(snapshot_dir)
-    if return_code != 0:
-        print(
-            f"zoty: snapshot compatibility worker exited with status {return_code}; using the legacy loader",
-            file=sys.stderr,
-        )
-
-
-def _load_corpus_parent_metadata(
-    snapshot_dir: Path,
-    corpus_docs: Sequence[dict[str, Any]],
-) -> tuple[Sequence[str], Sequence[int]]:
-    metadata_path = snapshot_dir / _CORPUS_METADATA_FILENAME
-    if not metadata_path.exists():
-        return _collect_corpus_parent_metadata(corpus_docs)
-
-    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    parent_keys = payload.get("parent_keys")
-    doc_parent_ids = payload.get("doc_parent_ids")
-    if payload.get("version") != 1:
-        raise ValueError("unsupported corpus metadata version")
-    if not isinstance(parent_keys, list) or not all(
-        isinstance(parent_key, str) and parent_key
-        for parent_key in parent_keys
-    ):
-        raise ValueError("corpus metadata has invalid parent keys")
-    if not isinstance(doc_parent_ids, list) or len(doc_parent_ids) != len(corpus_docs):
-        raise ValueError("corpus metadata document count does not match the BM25 corpus")
-    if not all(
-        isinstance(parent_id, int) and 0 <= parent_id < len(parent_keys)
-        for parent_id in doc_parent_ids
-    ):
-        raise ValueError("corpus metadata has invalid parent IDs")
-    return parent_keys, doc_parent_ids
-
-
-def _load_bm25_snapshot(
-    bm25_dir: Path,
-) -> tuple[bm25s.BM25, Sequence[dict[str, Any]]]:
-    vocabulary_path = bm25_dir / _VOCABULARY_DB_FILENAME
-    if vocabulary_path.exists():
-        try:
-            retriever = bm25s.BM25.load(
-                bm25_dir,
-                load_corpus=True,
-                load_vocab=False,
-                mmap=True,
-            )
-            retriever.vocab_dict = _SqliteVocabulary(vocabulary_path)
-            retriever.unique_token_ids_set = None
-            lazy_corpus = getattr(retriever, "corpus", None)
-            if lazy_corpus is None:
-                raise RuntimeError("snapshot is missing its saved corpus")
-            return retriever, _ThreadSafeCorpus(lazy_corpus)
-        except Exception as exc:
-            print(
-                f"zoty: failed to load compact BM25 vocabulary: {exc}; using the legacy vocabulary",
-                file=sys.stderr,
-            )
-
-    retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
-    retriever.unique_token_ids_set = None
-    lazy_corpus = getattr(retriever, "corpus", None)
-    if lazy_corpus is None:
-        raise RuntimeError("snapshot is missing its saved corpus")
-    return retriever, _ThreadSafeCorpus(lazy_corpus)
-
-
-def _load_snapshot(snapshot_id: str) -> _SearchState | None:
-    snapshot_dir = _snapshots_dir() / snapshot_id
-    if not snapshot_dir.exists():
-        return None
-
-    snapshot_meta_path = snapshot_dir / "snapshot.json"
-    if not snapshot_meta_path.exists():
-        return None
-
-    try:
-        snapshot_meta = json.loads(snapshot_meta_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"zoty: failed to read snapshot metadata: {exc}", file=sys.stderr)
-        return None
-
-    retriever: bm25s.BM25 | None = None
-    corpus_docs: Sequence[dict[str, Any]] = ()
-    doc_parent_keys: Sequence[str] = ()
-    doc_parent_ids: Sequence[int] = ()
-    bm25_dir = snapshot_dir / "bm25"
-    if bm25_dir.exists():
-        try:
-            _ensure_snapshot_low_memory_artifacts(snapshot_dir)
-            retriever, corpus_docs = _load_bm25_snapshot(bm25_dir)
-            doc_parent_keys, doc_parent_ids = _load_corpus_parent_metadata(
-                snapshot_dir,
-                corpus_docs,
-            )
-        except Exception as exc:
-            print(f"zoty: failed to load BM25 snapshot {snapshot_id}: {exc}", file=sys.stderr)
-            return None
-
+def _load_search_state() -> _SearchState | None:
     try:
         with closing(_connect_manifest()) as conn:
-            parents = _load_parent_state(conn)
+            if _get_meta(conn, "fts_schema_version") != _FTS_SCHEMA_VERSION:
+                return None
+            if _get_meta(conn, "fts_index_status") != "ready":
+                return None
+            source_fingerprint = _get_meta(conn, "last_source_fingerprint")
+            if not source_fingerprint:
+                return None
+            conn.execute("SELECT rowid FROM docs_fts LIMIT 0")
+            document_count = int(conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
+            return _SearchState(
+                source_fingerprint=source_fingerprint,
+                document_count=document_count,
+            )
     except Exception as exc:
-        print(f"zoty: failed to load manifest state: {exc}", file=sys.stderr)
+        print(f"zoty: failed to load FTS search state: {exc}", file=sys.stderr)
         return None
-
-    return _SearchState(
-        snapshot_id=snapshot_id,
-        source_fingerprint=snapshot_meta.get("source_fingerprint", ""),
-        retriever=retriever,
-        corpus_docs=corpus_docs,
-        parents=parents,
-        doc_parent_ids=doc_parent_ids,
-        doc_parent_keys=doc_parent_keys,
-    )
 
 
 def _install_state(state: _SearchState) -> None:
@@ -2091,40 +1733,76 @@ def _install_state(state: _SearchState) -> None:
         _search_state = state
 
 
-def _parent_key_for_ranked_doc(state: _SearchState, doc_index: int) -> str:
-    if state.doc_parent_ids and state.doc_parent_keys:
-        return state.doc_parent_keys[state.doc_parent_ids[doc_index]]
-    return str(state.corpus_docs[doc_index]["parent_key"])
+def _searchable_query_terms(query: str) -> list[str]:
+    return [term for term in _extract_query_terms(query) if term not in _ENGLISH_STOPWORDS]
 
 
-def _retrieve_ranked_doc_ids(
-    state: _SearchState,
-    query_tokens: Any,
-    *,
-    k: int,
-) -> tuple[Any, Any]:
-    return state.retriever.retrieve(
-        query_tokens,
-        corpus=range(len(state.corpus_docs)),
-        k=k,
-        show_progress=False,
+def _fts_match_expression(query: str) -> str:
+    return " OR ".join(
+        f'"{term.replace(chr(34), chr(34) * 2)}"'
+        for term in _searchable_query_terms(query)
     )
 
 
-def _active_snapshot_id() -> str:
-    with closing(_connect_manifest()) as conn:
-        return _get_meta(conn, "active_snapshot_id")
+def _doc_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "doc_id": row["doc_id"],
+        "parent_key": row["parent_key"],
+        "attachment_key": row["attachment_key"],
+        "doc_kind": row["doc_kind"],
+        "chunk_index": int(row["chunk_index"]),
+        "char_start": int(row["char_start"]),
+        "char_end": int(row["char_end"]),
+        "token_count": int(row["token_count"]),
+        "text": row["text"],
+        "text_hash": row["text_hash"],
+    }
 
 
-def _prune_snapshots(*keep_snapshot_ids: str) -> None:
-    keep = {snapshot_id for snapshot_id in keep_snapshot_ids if snapshot_id}
-    with _index_lock:
-        for path in _snapshots_dir().iterdir():
-            if not path.is_dir():
-                continue
-            if path.name in keep or path.name.startswith("."):
-                continue
-            shutil.rmtree(path, ignore_errors=True)
+def _load_docs_by_rowid(
+    conn: sqlite3.Connection,
+    rowids: list[int],
+) -> dict[int, dict[str, Any]]:
+    if not rowids:
+        return {}
+    placeholders = ",".join("?" for _ in rowids)
+    rows = conn.execute(
+        f"""SELECT rowid, doc_id, parent_key, attachment_key, doc_kind,
+                   chunk_index, char_start, char_end, token_count, text, text_hash
+            FROM docs
+            WHERE rowid IN ({placeholders})""",
+        rowids,
+    )
+    return {int(row["rowid"]): _doc_from_row(row) for row in rows}
+
+
+def _ranked_fts_rows(
+    conn: sqlite3.Connection,
+    match_expression: str,
+    *,
+    parent_keys: list[str] | None = None,
+    limit: int | None = None,
+) -> sqlite3.Cursor:
+    clauses = ["docs_fts MATCH ?"]
+    parameters: list[Any] = [match_expression]
+    if parent_keys:
+        placeholders = ",".join("?" for _ in parent_keys)
+        clauses.append(f"d.parent_key IN ({placeholders})")
+        parameters.extend(parent_keys)
+
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = " LIMIT ?"
+        parameters.append(limit)
+
+    return conn.execute(
+        f"""SELECT d.rowid, d.parent_key, -bm25(docs_fts) AS score
+            FROM docs_fts
+            JOIN docs AS d ON d.rowid = docs_fts.rowid
+            WHERE {' AND '.join(clauses)}
+            ORDER BY bm25(docs_fts), d.doc_id{limit_sql}""",
+        parameters,
+    )
 
 
 def _start_refresh_thread(*, force: bool = False) -> None:
@@ -2141,27 +1819,13 @@ def _start_refresh_thread(*, force: bool = False) -> None:
 
 
 def prepare_search_index(*, force_refresh: bool = False) -> None:
-    """Load the active snapshot if present and queue a refresh when needed."""
-    try:
-        with closing(_connect_manifest(writable=True)) as conn:
-            _initialize_manifest(conn)
-            active_snapshot_id = _get_meta(conn, "active_snapshot_id")
-            stored_fingerprint = _get_meta(conn, "last_source_fingerprint")
-    except Exception as exc:
-        print(f"zoty: failed to initialize sidecar manifest: {exc}", file=sys.stderr)
-        active_snapshot_id = ""
-        stored_fingerprint = ""
-
+    """Load the FTS index if ready and queue changed source material."""
     with _index_lock:
-        has_state = _search_state is not None
-
-    loaded_snapshot = has_state
-    if active_snapshot_id and not has_state:
-        with _index_lock:
-            state = _search_state if _search_state is not None else _load_snapshot(active_snapshot_id)
+        state = _search_state
+    if state is None and _manifest_db_path().exists():
+        state = _load_search_state()
         if state is not None:
             _install_state(state)
-            loaded_snapshot = True
 
     try:
         current_fingerprint = _compute_source_fingerprint()
@@ -2169,8 +1833,10 @@ def prepare_search_index(*, force_refresh: bool = False) -> None:
         print(f"zoty: failed to inspect Zotero source fingerprint: {exc}", file=sys.stderr)
         current_fingerprint = ""
 
-    needs_refresh = force_refresh or not loaded_snapshot or not active_snapshot_id
-    if current_fingerprint and current_fingerprint != stored_fingerprint:
+    needs_refresh = force_refresh or state is None
+    if current_fingerprint and (
+        state is None or current_fingerprint != state.source_fingerprint
+    ):
         needs_refresh = True
 
     if needs_refresh:
@@ -2178,7 +1844,7 @@ def prepare_search_index(*, force_refresh: bool = False) -> None:
 
 
 def _refresh_search_index_once() -> None:
-    """Build and publish one snapshot inside the refresh worker process."""
+    """Apply source changes to the FTS index inside the refresh worker."""
     current_fingerprint = _compute_source_fingerprint()
     parents = _fetch_parent_records()
     attachments = _fetch_attachment_records(parents)
@@ -2200,29 +1866,23 @@ def _refresh_search_index_once() -> None:
             print(f"zoty: full-text ensure failed: {exc}", file=sys.stderr)
 
     with closing(_connect_manifest(writable=True)) as conn:
-        _initialize_manifest(conn)
-        previous_snapshot_id = _get_meta(conn, "active_snapshot_id")
+        migrated_doc_count = _initialize_manifest(conn)
         _set_meta(conn, "last_refresh_started_at", _now_iso())
         _set_meta(conn, "last_refresh_status", "running")
         conn.commit()
 
-        _refresh_docs_manifest(conn, parents, attachments)
-        docs = _load_docs_for_snapshot(conn)
-        snapshot_id, ranked_doc_count = _build_snapshot(
-            docs,
-            source_fingerprint=current_fingerprint,
-            parent_count=len(parents),
-            attachment_count=len(attachments),
-        )
-        _set_meta(conn, "active_snapshot_id", snapshot_id)
+        changed_doc_count = _refresh_docs_manifest(conn, parents, attachments)
+        indexed_doc_count = int(conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
         _set_meta(conn, "last_source_fingerprint", current_fingerprint)
         _set_meta(conn, "last_refresh_finished_at", _now_iso())
         _set_meta(conn, "last_refresh_status", "ready")
         conn.commit()
 
-    _prune_snapshots(snapshot_id, previous_snapshot_id)
     print(
-        f"zoty: search index ready ({len(parents)} parents, {len(attachments)} attachments, {ranked_doc_count} ranked docs)",
+        "zoty: search index ready "
+        f"({len(parents)} parents, {len(attachments)} attachments, "
+        f"{indexed_doc_count} indexed docs, {changed_doc_count} changed, "
+        f"{migrated_doc_count} migrated)",
         file=sys.stderr,
     )
 
@@ -2247,22 +1907,12 @@ def _worker_recorded_refresh_failure() -> bool:
 
 
 def run_index_refresh_worker() -> int:
-    """Build and publish one index snapshot, returning a process exit code."""
+    """Apply one FTS refresh and return a process exit code."""
     try:
         _refresh_search_index_once()
     except Exception as exc:
         _record_refresh_failure(str(exc))
         print(f"zoty: failed to build search index: {exc}", file=sys.stderr)
-        return 1
-    return 0
-
-
-def run_snapshot_prepare_worker(snapshot_dir: Path) -> int:
-    """Create low-memory lookup files for one existing snapshot."""
-    try:
-        prepare_snapshot_for_low_memory(snapshot_dir)
-    except Exception as exc:
-        print(f"zoty: failed to prepare snapshot lookup files: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -2281,50 +1931,30 @@ def _refresh_worker_command() -> list[str]:
     ]
 
 
-def _snapshot_prepare_worker_command(snapshot_dir: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "zoty._index_worker",
-        "--prepare-snapshot",
-        str(snapshot_dir),
-    ]
-
-
 def _run_refresh_worker_process() -> int:
     completed = subprocess.run(_refresh_worker_command(), check=False)
     return completed.returncode
 
 
-def _run_snapshot_prepare_worker_process(snapshot_dir: Path) -> int:
-    completed = subprocess.run(
-        _snapshot_prepare_worker_command(snapshot_dir),
-        check=False,
-    )
-    return completed.returncode
-
-
 def build_index_background() -> None:
-    """Refresh in a worker process and swap in its published snapshot."""
+    """Refresh in a worker process and expose its committed FTS state."""
     global _refresh_in_progress, _refresh_requested
     rerun = False
     worker_failed = False
     try:
-        previous_snapshot_id = _active_snapshot_id()
         return_code = _run_refresh_worker_process()
         if return_code != 0:
             worker_failed = True
             raise RuntimeError(f"index refresh worker exited with status {return_code}")
 
-        snapshot_id = _active_snapshot_id()
-        if not snapshot_id or snapshot_id == previous_snapshot_id:
-            raise RuntimeError("index refresh worker did not publish a new snapshot")
-
-        state = _load_snapshot(snapshot_id)
+        state = _load_search_state()
         if state is None:
-            raise RuntimeError(f"failed to load published snapshot {snapshot_id}")
+            raise RuntimeError("index refresh worker did not publish a usable FTS index")
         _install_state(state)
     except Exception as exc:
+        fallback_state = _load_search_state()
+        if fallback_state is not None:
+            _install_state(fallback_state)
         if not worker_failed or not _worker_recorded_refresh_failure():
             _record_refresh_failure(str(exc))
         print(f"zoty: failed to build search index: {exc}", file=sys.stderr)
@@ -2390,6 +2020,11 @@ def _snippet_from_text(text: str, query_terms: list[str], *, limit: int = 240) -
     return normalized[start:end].strip()
 
 
+def _relevance_score(score: float) -> float:
+    """Keep useful precision across the different score scales search engines use."""
+    return float(f"{score:.6g}")
+
+
 def _result_from_parent(
     parent: dict[str, Any],
     *,
@@ -2416,7 +2051,7 @@ def _result_from_parent(
         ),
         "abstract": parent["abstract"][:500] + "..." if len(parent["abstract"]) > 500 else parent["abstract"],
         "attachment_count": attachment_count,
-        "score": round(score, 4),
+        "score": _relevance_score(score),
     }
     if attachments is not None:
         result["attachments"] = list(attachments)
@@ -2580,7 +2215,7 @@ def _result_from_doc(
 ) -> dict[str, Any]:
     snippet_source = doc["text"] if doc["doc_kind"] == "attachment_chunk" else (parent["abstract"] or doc["text"])
     result = {
-        "score": round(score, 4),
+        "score": _relevance_score(score),
         "match_type": doc["doc_kind"],
         "snippet": _snippet_from_text(snippet_source, query_terms),
         "chunk_index": doc["chunk_index"],
@@ -2695,9 +2330,8 @@ def search(
     limit: int = 10,
     include_attachments: bool = False,
 ) -> str:
-    """BM25 ranked search over titles, abstracts, and indexed attachment full text."""
+    """FTS5-ranked search over titles, abstracts, and attachment full text."""
     requested_limit, applied_limit = _apply_limit_cap(limit, _SEARCH_RESULT_LIMIT_CAP)
-    collection_name_by_key = _load_collection_name_map()
     normalized_collection_key = collection_key.strip().upper()
     normalized_item_type = item_type.strip().lower()
 
@@ -2713,53 +2347,9 @@ def search(
             error="Index is still building, please retry in a moment",
         )
 
-    if state.retriever is None or not state.corpus_docs:
-        return _search_response(
-            query,
-            [],
-            requested_limit=requested_limit,
-            applied_limit=applied_limit,
-        )
-
-    filter_warnings: list[str] = []
-    if normalized_collection_key:
-        known_collection_keys = {
-            collection.strip().upper()
-            for parent in state.parents.values()
-            for collection in parent.get("collections", [])
-            if collection.strip()
-        }
-        if normalized_collection_key not in known_collection_keys:
-            filter_warnings.append(
-                f"Collection {normalized_collection_key} was not found in the search index",
-            )
-    if normalized_item_type:
-        known_item_types = {
-            str(parent.get("itemType", "")).lower()
-            for parent in state.parents.values()
-            if str(parent.get("itemType", "")).strip()
-        }
-        if normalized_item_type not in known_item_types:
-            filter_warnings.append(
-                f"Item type {item_type!r} was not found in the search index",
-            )
-    if filter_warnings:
-        return _search_response(
-            query,
-            [],
-            requested_limit=requested_limit,
-            applied_limit=applied_limit,
-            warning=" ".join(filter_warnings),
-        )
-
-    query_tokens = bm25s.tokenize(
-        [query],
-        stopwords="en",
-        show_progress=False,
-        return_ids=False,
-    )
     query_terms = _extract_query_terms(query)
-    if not query_terms or not query_tokens or not query_tokens[0]:
+    match_expression = _fts_match_expression(query)
+    if not match_expression:
         return _search_response(
             query,
             [],
@@ -2768,58 +2358,96 @@ def search(
             warning=_EMPTY_QUERY_WARNING,
         )
 
-    max_docs = len(state.corpus_docs)
-    batch_size = min(max(applied_limit * 20, 200), max_docs)
-    best_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        with closing(_connect_manifest()) as conn:
+            conn.execute("BEGIN")
+            parents = _load_parent_state(conn)
 
-    while batch_size > 0:
-        ranked_doc_ids, scores = _retrieve_ranked_doc_ids(
-            state,
-            query_tokens,
-            k=batch_size,
+            filter_warnings: list[str] = []
+            if normalized_collection_key:
+                known_collection_keys = {
+                    collection.strip().upper()
+                    for parent in parents.values()
+                    for collection in parent.get("collections", [])
+                    if collection.strip()
+                }
+                if normalized_collection_key not in known_collection_keys:
+                    filter_warnings.append(
+                        f"Collection {normalized_collection_key} was not found in the search index",
+                    )
+            if normalized_item_type:
+                known_item_types = {
+                    str(parent.get("itemType", "")).lower()
+                    for parent in parents.values()
+                    if str(parent.get("itemType", "")).strip()
+                }
+                if normalized_item_type not in known_item_types:
+                    filter_warnings.append(
+                        f"Item type {item_type!r} was not found in the search index",
+                    )
+            if filter_warnings:
+                return _search_response(
+                    query,
+                    [],
+                    requested_limit=requested_limit,
+                    applied_limit=applied_limit,
+                    warning=" ".join(filter_warnings),
+                )
+
+            best_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in _ranked_fts_rows(conn, match_expression):
+                parent_key = str(row["parent_key"])
+                parent = parents.get(parent_key)
+                if not parent:
+                    continue
+                if (
+                    normalized_collection_key
+                    and normalized_collection_key not in parent["collections"]
+                ):
+                    continue
+                if (
+                    normalized_item_type
+                    and parent["itemType"].lower() != normalized_item_type
+                ):
+                    continue
+
+                score = float(row["score"])
+                identity = _search_result_identity(parent)
+                preference = _search_result_preference(parent, score)
+                previous = best_by_identity.get(identity)
+                if previous is None or preference > previous["preference"]:
+                    best_by_identity[identity] = {
+                        "parent_key": parent_key,
+                        "score": score,
+                        "rowid": int(row["rowid"]),
+                        "preference": preference,
+                    }
+
+            ordered_entries = list(best_by_identity.values())
+            ordered_entries.sort(key=lambda entry: parents[entry["parent_key"]]["key"])
+            ordered_entries.sort(
+                key=lambda entry: parents[entry["parent_key"]]["dateModified"],
+                reverse=True,
+            )
+            ordered_entries.sort(key=lambda entry: entry["score"], reverse=True)
+            returned_entries = ordered_entries[:applied_limit]
+            docs_by_rowid = _load_docs_by_rowid(
+                conn,
+                [entry["rowid"] for entry in returned_entries],
+            )
+    except sqlite3.Error as exc:
+        print(f"zoty: FTS search failed: {exc}", file=sys.stderr)
+        return _search_response(
+            query,
+            [],
+            requested_limit=requested_limit,
+            applied_limit=applied_limit,
+            error="Search index is unavailable, please retry in a moment",
         )
 
-        for index in range(ranked_doc_ids.shape[1]):
-            doc_index = int(ranked_doc_ids[0, index])
-            score = float(scores[0, index])
-            if score <= 0:
-                continue
-
-            parent_key = _parent_key_for_ranked_doc(state, doc_index)
-            parent = state.parents.get(parent_key)
-            if not parent:
-                continue
-            if normalized_collection_key and normalized_collection_key not in parent["collections"]:
-                continue
-            if normalized_item_type and parent["itemType"].lower() != normalized_item_type:
-                continue
-
-            identity = _search_result_identity(parent)
-            preference = _search_result_preference(parent, score)
-            previous = best_by_identity.get(identity)
-            if previous is None or preference > previous["preference"]:
-                best_by_identity[identity] = {
-                    "parent_key": parent_key,
-                    "score": score,
-                    "doc_index": doc_index,
-                    "preference": preference,
-                }
-
-        if batch_size >= max_docs:
-            break
-
-        batch_size = min(max_docs, batch_size * 2)
-
-    ordered_entries = list(best_by_identity.values())
-    ordered_entries.sort(key=lambda entry: state.parents[entry["parent_key"]]["key"])
-    ordered_entries.sort(
-        key=lambda entry: state.parents[entry["parent_key"]]["dateModified"],
-        reverse=True,
-    )
-    ordered_entries.sort(key=lambda entry: entry["score"], reverse=True)
     total_matches = len(ordered_entries)
-    returned_entries = ordered_entries[:applied_limit]
     selected_parent_keys = [entry["parent_key"] for entry in returned_entries]
+    collection_name_by_key = _load_collection_name_map()
 
     if include_attachments:
         attachments_by_parent = _get_item_attachments_by_parent(selected_parent_keys)
@@ -2834,10 +2462,10 @@ def search(
     results_payload = []
     for entry in returned_entries:
         parent_key = entry["parent_key"]
-        best_doc = state.corpus_docs[entry["doc_index"]]
+        best_doc = docs_by_rowid[entry["rowid"]]
         results_payload.append(
             _result_from_parent(
-                state.parents[parent_key],
+                parents[parent_key],
                 score=entry["score"],
                 best_doc=best_doc,
                 query_terms=query_terms,
@@ -2866,7 +2494,7 @@ def search_within_item(
     limit: int = 5,
     item_keys: list[str] | None = None,
 ) -> str:
-    """BM25 ranked passage search within one or more parent items.
+    """FTS5-ranked passage search within one or more parent items.
 
     The public caller should prefer `item_keys`; `item_key` remains a narrow
     compatibility shim for older internal callers.
@@ -2914,10 +2542,96 @@ def search_within_item(
             error="Index is still building, please retry in a moment",
         )
 
-    found_item_keys = [key for key in unique_requested_keys if key in state.parents]
-    missing_item_keys = [key for key in unique_requested_keys if key not in state.parents]
+    query_terms = _extract_query_terms(query)
+    match_expression = _fts_match_expression(query)
 
-    if not found_item_keys:
+    try:
+        with closing(_connect_manifest()) as conn:
+            conn.execute("BEGIN")
+            parents = _load_parent_state(conn)
+            found_item_keys = [key for key in unique_requested_keys if key in parents]
+            missing_item_keys = [key for key in unique_requested_keys if key not in parents]
+
+            if not found_item_keys:
+                if multi_item:
+                    return _search_within_item_response(
+                        query=query,
+                        matches=[],
+                        requested_limit=requested_limit,
+                        applied_limit=applied_limit,
+                        item_keys=unique_requested_keys,
+                        items=[],
+                        missing_item_keys=missing_item_keys,
+                        error="None of the requested item keys were found in the search index",
+                    )
+                return _search_within_item_response(
+                    key=normalized_item_key,
+                    query=query,
+                    matches=[],
+                    requested_limit=requested_limit,
+                    applied_limit=applied_limit,
+                    error=f"Item {normalized_item_key} was not found in the search index",
+                )
+
+            item_summary = None
+            if not multi_item:
+                item_summary = _item_summary_from_parent(parents[normalized_item_key])
+
+            warnings: list[str] = []
+            if not match_expression:
+                warnings.append(_EMPTY_QUERY_WARNING)
+            if missing_item_keys:
+                warnings.append(
+                    "Some requested item keys were not found in the search index: "
+                    + ", ".join(missing_item_keys)
+                )
+
+            if not match_expression or applied_limit == 0:
+                warning = " ".join(warnings) or None
+                if multi_item:
+                    return _search_within_item_response(
+                        query=query,
+                        matches=[],
+                        requested_limit=requested_limit,
+                        applied_limit=applied_limit,
+                        item_keys=found_item_keys,
+                        items=_multi_item_summaries_from_matches(
+                            found_item_keys,
+                            parents,
+                            [],
+                        ),
+                        missing_item_keys=missing_item_keys,
+                        warning=warning,
+                    )
+                return _search_within_item_response(
+                    key=normalized_item_key,
+                    query=query,
+                    matches=[],
+                    requested_limit=requested_limit,
+                    applied_limit=applied_limit,
+                    item=item_summary,
+                    warning=warning,
+                )
+
+            ranked_rows = [
+                {
+                    "rowid": int(row["rowid"]),
+                    "parent_key": str(row["parent_key"]),
+                    "score": float(row["score"]),
+                }
+                for row in _ranked_fts_rows(
+                    conn,
+                    match_expression,
+                    parent_keys=found_item_keys,
+                    limit=applied_limit,
+                )
+            ]
+            docs_by_rowid = _load_docs_by_rowid(
+                conn,
+                [row["rowid"] for row in ranked_rows],
+            )
+    except sqlite3.Error as exc:
+        print(f"zoty: FTS item search failed: {exc}", file=sys.stderr)
         if multi_item:
             return _search_within_item_response(
                 query=query,
@@ -2926,8 +2640,7 @@ def search_within_item(
                 applied_limit=applied_limit,
                 item_keys=unique_requested_keys,
                 items=[],
-                missing_item_keys=missing_item_keys,
-                error="None of the requested item keys were found in the search index",
+                error="Search index is unavailable, please retry in a moment",
             )
         return _search_within_item_response(
             key=normalized_item_key,
@@ -2935,99 +2648,7 @@ def search_within_item(
             matches=[],
             requested_limit=requested_limit,
             applied_limit=applied_limit,
-            error=f"Item {normalized_item_key} was not found in the search index",
-        )
-
-    if not multi_item:
-        item_summary = _item_summary_from_parent(state.parents[normalized_item_key])
-
-    if state.retriever is None or not state.corpus_docs:
-        if multi_item:
-            warning = None
-            if missing_item_keys:
-                warning = (
-                    "Some requested item keys were not found in the search index: "
-                    + ", ".join(missing_item_keys)
-                )
-            return _search_within_item_response(
-                query=query,
-                matches=[],
-                requested_limit=requested_limit,
-                applied_limit=applied_limit,
-                item_keys=found_item_keys,
-                items=_multi_item_summaries_from_matches(found_item_keys, state.parents, []),
-                missing_item_keys=missing_item_keys,
-                warning=warning,
-            )
-        return _search_within_item_response(
-            key=normalized_item_key,
-            query=query,
-            matches=[],
-            requested_limit=requested_limit,
-            applied_limit=applied_limit,
-            item=item_summary,
-        )
-
-    query_tokens = bm25s.tokenize(
-        [query],
-        stopwords="en",
-        show_progress=False,
-        return_ids=False,
-    )
-    query_terms = _extract_query_terms(query)
-    if not query_terms or not query_tokens or not query_tokens[0]:
-        warnings = [_EMPTY_QUERY_WARNING]
-        if missing_item_keys:
-            warnings.append(
-                "Some requested item keys were not found in the search index: "
-                + ", ".join(missing_item_keys),
-            )
-        if multi_item:
-            return _search_within_item_response(
-                query=query,
-                matches=[],
-                requested_limit=requested_limit,
-                applied_limit=applied_limit,
-                item_keys=found_item_keys,
-                items=_multi_item_summaries_from_matches(found_item_keys, state.parents, []),
-                missing_item_keys=missing_item_keys,
-                warning=" ".join(warnings),
-            )
-        return _search_within_item_response(
-            key=normalized_item_key,
-            query=query,
-            matches=[],
-            requested_limit=requested_limit,
-            applied_limit=applied_limit,
-            item=item_summary,
-            warning=_EMPTY_QUERY_WARNING,
-        )
-
-    if applied_limit == 0:
-        if multi_item:
-            warning = None
-            if missing_item_keys:
-                warning = (
-                    "Some requested item keys were not found in the search index: "
-                    + ", ".join(missing_item_keys)
-                )
-            return _search_within_item_response(
-                query=query,
-                matches=[],
-                requested_limit=requested_limit,
-                applied_limit=applied_limit,
-                item_keys=found_item_keys,
-                items=_multi_item_summaries_from_matches(found_item_keys, state.parents, []),
-                missing_item_keys=missing_item_keys,
-                warning=warning,
-            )
-        return _search_within_item_response(
-            key=normalized_item_key,
-            query=query,
-            matches=[],
-            requested_limit=requested_limit,
-            applied_limit=applied_limit,
-            item=item_summary,
+            error="Search index is unavailable, please retry in a moment",
         )
 
     attachments_by_parent = _get_item_attachments_by_parent(found_item_keys)
@@ -3035,51 +2656,17 @@ def search_within_item(
         parent_key: {attachment["key"]: attachment for attachment in attachments}
         for parent_key, attachments in attachments_by_parent.items()
     }
-
-    max_docs = len(state.corpus_docs)
-    batch_size = min(max(applied_limit * 20, 200), max_docs)
-    matches: list[dict[str, Any]] = []
-    seen_doc_indices: set[int] = set()
-    found_item_key_set = set(found_item_keys)
-
-    while batch_size > 0:
-        ranked_doc_ids, scores = _retrieve_ranked_doc_ids(
-            state,
-            query_tokens,
-            k=batch_size,
+    matches = [
+        _result_from_doc(
+            parents[row["parent_key"]],
+            score=row["score"],
+            doc=docs_by_rowid[row["rowid"]],
+            query_terms=query_terms,
+            attachments_by_key=attachments_lookup_by_parent.get(row["parent_key"], {}),
+            include_parent_key=multi_item,
         )
-
-        found_enough = False
-        for index in range(ranked_doc_ids.shape[1]):
-            doc_index = int(ranked_doc_ids[0, index])
-            score = float(scores[0, index])
-            if score <= 0:
-                continue
-            parent_key = _parent_key_for_ranked_doc(state, doc_index)
-            if parent_key not in found_item_key_set:
-                continue
-            if doc_index in seen_doc_indices:
-                continue
-
-            seen_doc_indices.add(doc_index)
-            doc = state.corpus_docs[doc_index]
-            matches.append(_result_from_doc(
-                state.parents[parent_key],
-                score=score,
-                doc=doc,
-                query_terms=query_terms,
-                attachments_by_key=attachments_lookup_by_parent.get(parent_key, {}),
-                include_parent_key=multi_item,
-            ))
-
-            if len(matches) >= applied_limit:
-                found_enough = True
-                break
-
-        if found_enough or batch_size >= max_docs:
-            break
-
-        batch_size = min(max_docs, batch_size * 2)
+        for row in ranked_rows
+    ]
 
     if multi_item:
         warning = None
@@ -3096,7 +2683,7 @@ def search_within_item(
             item_keys=found_item_keys,
             items=_multi_item_summaries_from_matches(
                 found_item_keys,
-                state.parents,
+                parents,
                 matches[:applied_limit],
             ),
             missing_item_keys=missing_item_keys,

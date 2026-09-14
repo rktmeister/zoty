@@ -9,45 +9,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import bm25s
-
 from zoty import db
-
-
-class FakeMatrix:
-    def __init__(self, rows):
-        self._rows = rows
-        width = len(rows[0]) if rows else 0
-        self.shape = (len(rows), width)
-
-    def __getitem__(self, index):
-        row, col = index
-        return self._rows[row][col]
-
-
-class FakeRetriever:
-    def __init__(self, rows):
-        self._rows = rows
-        self.calls = []
-
-    def retrieve(self, query_tokens, corpus=None, k=10, show_progress=False):
-        self.calls.append(
-            {
-                "query_tokens": query_tokens,
-                "corpus": corpus,
-                "k": k,
-                "show_progress": show_progress,
-            }
-        )
-        pairs = self._rows[:k]
-        documents = [
-            corpus[index] if corpus is not None else doc
-            for index, (doc, _score) in enumerate(pairs)
-        ]
-        return (
-            FakeMatrix([documents]),
-            FakeMatrix([[score for _doc, score in pairs]]),
-        )
 
 
 class FakeResponse:
@@ -147,17 +109,37 @@ class DbTestCase(unittest.TestCase):
                 }
             }
 
-        corpus_docs = [doc for doc, _score in docs]
-        parent_keys, doc_parent_ids = db._collect_corpus_parent_metadata(corpus_docs)
-        db._search_state = db._SearchState(
-            snapshot_id="snapshot-1",
-            source_fingerprint="fingerprint-1",
-            retriever=FakeRetriever([(doc, score) for doc, score in docs]),
-            corpus_docs=corpus_docs,
-            parents=parents,
-            doc_parent_ids=doc_parent_ids,
-            doc_parent_keys=parent_keys,
-        )
+        with closing(db._connect_manifest(writable=True)) as conn:
+            db._initialize_manifest(conn)
+            for parent_item_id, parent in enumerate(parents.values(), start=1):
+                db._upsert_parent(
+                    conn,
+                    db._ParentRecord(
+                        parent_key=parent["key"],
+                        parent_item_id=parent_item_id,
+                        item_version=1,
+                        date_modified=parent["dateModified"],
+                        item_type=parent["itemType"],
+                        title=parent["title"],
+                        abstract=parent["abstract"],
+                        creators=list(parent["creators"]),
+                        collections=list(parent["collections"]),
+                        tags=list(parent["tags"]),
+                        date=parent["date"],
+                        doi=parent["DOI"],
+                        url=parent["url"],
+                        metadata_hash=f"hash-{parent['key']}",
+                    ),
+                )
+            for doc, _score in docs:
+                db._insert_doc(conn, doc)
+            db._set_meta(conn, "last_source_fingerprint", "fingerprint-1")
+            db._set_meta(conn, "last_refresh_status", "ready")
+            conn.commit()
+
+        state = db._load_search_state()
+        self.assertIsNotNone(state)
+        db._search_state = state
 
 
 class AttachmentPathsTests(DbTestCase):
@@ -651,10 +633,14 @@ class AttachmentPathsTests(DbTestCase):
             result = json.loads(db.search("example", limit=2, include_attachments=True))
 
         self.assertEqual(result["total"], 2)
-        self.assertEqual([row["key"] for row in result["items"]], ["PARENT1", "PARENT2"])
-        self.assertEqual([row["attachment_count"] for row in result["items"]], [1, 1])
+        items_by_key = {row["key"]: row for row in result["items"]}
+        self.assertEqual(set(items_by_key), {"PARENT1", "PARENT2"})
         self.assertEqual(
-            result["items"][0]["attachments"][0],
+            [items_by_key[key]["attachment_count"] for key in ("PARENT1", "PARENT2")],
+            [1, 1],
+        )
+        self.assertEqual(
+            items_by_key["PARENT1"]["attachments"][0],
             {
                 "key": "ATTACH1",
                 "title": "Attached PDF",
@@ -663,7 +649,7 @@ class AttachmentPathsTests(DbTestCase):
             },
         )
         self.assertEqual(
-            result["items"][1]["attachments"][0],
+            items_by_key["PARENT2"]["attachments"][0],
             {
                 "key": "ATTACH2",
                 "title": "Attached EPUB",
@@ -1467,13 +1453,43 @@ class SearchBehaviorTests(DbTestCase):
             )
             conn.commit()
 
-    def test_search_returns_error_when_snapshot_not_loaded(self):
+    def test_search_returns_error_when_index_not_loaded(self):
         db._search_state = None
 
         result = json.loads(db.search("body only"))
 
         self.assertEqual(result["error"], "Index is still building, please retry in a moment")
         self.assertEqual(result["items"], [])
+
+    def test_search_returns_actionable_error_when_fts_query_fails(self):
+        doc = {
+            "doc_id": "meta:PARENT1",
+            "parent_key": "PARENT1",
+            "attachment_key": "",
+            "doc_kind": "metadata",
+            "chunk_index": 0,
+            "char_start": 0,
+            "char_end": 20,
+            "token_count": 3,
+            "text": "query match first",
+            "text_hash": "hash-1",
+        }
+        self._install_search_state([(doc, 1.0)])
+
+        with (
+            patch(
+                "zoty.db._ranked_fts_rows",
+                side_effect=sqlite3.DatabaseError("damaged index"),
+            ),
+            patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            result = json.loads(db.search("query"))
+
+        self.assertEqual(result["items"], [])
+        self.assertEqual(
+            result["error"],
+            "Search index is unavailable, please retry in a moment",
+        )
 
     def test_body_only_query_returns_parent_with_attachment_snippet(self):
         attachment_doc = {
@@ -1671,7 +1687,7 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["returned_count"], 2)
         self.assertEqual([row["key"] for row in result["items"]], ["PARENT1", "PARENT2"])
-        self.assertEqual(result["items"][0]["score"], 9.0)
+        self.assertIsInstance(result["items"][0]["score"], float)
 
     def test_search_deduplicates_duplicate_papers_and_prefers_richer_item(self):
         parents = {
@@ -1801,7 +1817,10 @@ class SearchBehaviorTests(DbTestCase):
 
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["returned_count"], 2)
-        self.assertEqual([row["key"] for row in result["items"]], ["PARENT1", "PARENT2"])
+        self.assertCountEqual(
+            [row["key"] for row in result["items"]],
+            ["PARENT1", "PARENT2"],
+        )
 
     def test_collection_and_item_type_filters_apply_at_parent_level(self):
         parents = {
@@ -1916,18 +1935,6 @@ class SearchBehaviorTests(DbTestCase):
         )
 
     def test_search_caps_large_requested_limits_and_reports_metadata(self):
-        class CountingCorpus:
-            def __init__(self, corpus_docs):
-                self.corpus_docs = corpus_docs
-                self.read_count = 0
-
-            def __len__(self):
-                return len(self.corpus_docs)
-
-            def __getitem__(self, index):
-                self.read_count += 1
-                return self.corpus_docs[index]
-
         parents = {}
         docs = []
         for index in range(600):
@@ -1963,10 +1970,12 @@ class SearchBehaviorTests(DbTestCase):
                 )
             )
         self._install_search_state(docs, parents=parents)
-        counting_corpus = CountingCorpus(db._search_state.corpus_docs)
-        db._search_state.corpus_docs = counting_corpus
 
-        result = json.loads(db.search("query", limit=1000))
+        with patch(
+            "zoty.db._load_docs_by_rowid",
+            wraps=db._load_docs_by_rowid,
+        ) as load_docs_mock:
+            result = json.loads(db.search("query", limit=1000))
 
         self.assertEqual(result["requested_limit"], 1000)
         self.assertEqual(result["applied_limit"], db._SEARCH_RESULT_LIMIT_CAP)
@@ -1975,12 +1984,10 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["total"], 600)
         self.assertEqual(result["returned_count"], db._SEARCH_RESULT_LIMIT_CAP)
         self.assertEqual(len(result["items"]), db._SEARCH_RESULT_LIMIT_CAP)
-        self.assertEqual([call["k"] for call in db._search_state.retriever.calls], [500, 600])
-        self.assertTrue(
-            all(isinstance(call["corpus"], range) for call in db._search_state.retriever.calls)
+        self.assertEqual(
+            len(load_docs_mock.call_args.args[1]),
+            db._SEARCH_RESULT_LIMIT_CAP,
         )
-        self.assertEqual(counting_corpus.read_count, db._SEARCH_RESULT_LIMIT_CAP)
-        self.assertEqual(result["items"][0]["key"], "PARENT1")
 
     def test_search_preserves_zero_requested_limit_while_reporting_total_matches(self):
         self._install_search_state([
@@ -2007,7 +2014,6 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["applied_limit"], 0)
         self.assertEqual(result["limit_cap"], db._SEARCH_RESULT_LIMIT_CAP)
         self.assertFalse(result["limit_capped"])
-        self.assertEqual([call["k"] for call in db._search_state.retriever.calls], [1])
 
     def test_search_preserves_zero_requested_limit_while_returning_empty_query_warning(self):
         self._install_search_state([
@@ -2033,7 +2039,6 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["requested_limit"], 0)
         self.assertEqual(result["applied_limit"], 0)
         self.assertEqual(result["warning"], db._EMPTY_QUERY_WARNING)
-        self.assertEqual(db._search_state.retriever.calls, [])
 
     def test_search_returns_warning_when_query_has_no_searchable_terms(self):
         self._install_search_state([
@@ -2057,7 +2062,6 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["total"], 0)
         self.assertEqual(result["returned_count"], 0)
         self.assertEqual(result["warning"], db._EMPTY_QUERY_WARNING)
-        self.assertEqual(db._search_state.retriever.calls, [])
 
     def test_search_does_not_return_warning_for_valid_zero_match_query(self):
         self._install_search_state([
@@ -2121,7 +2125,7 @@ class SearchBehaviorTests(DbTestCase):
                 "char_start": 0,
                 "char_end": 25,
                 "token_count": 4,
-                "text": "query match strongest chunk",
+                "text": "query query query match strongest chunk",
                 "text_hash": "hash-1",
             }, 9.0),
             ({
@@ -2133,7 +2137,7 @@ class SearchBehaviorTests(DbTestCase):
                 "char_start": 30,
                 "char_end": 60,
                 "token_count": 4,
-                "text": "query match second chunk",
+                "text": "query query match second chunk",
                 "text_hash": "hash-2",
             }, 8.5),
             ({
@@ -2181,7 +2185,14 @@ class SearchBehaviorTests(DbTestCase):
             [row["match_type"] for row in result["matches"]],
             ["attachment_chunk", "attachment_chunk", "metadata"],
         )
-        self.assertEqual([row["score"] for row in result["matches"]], [9.0, 8.5, 7.5])
+        self.assertGreater(
+            result["matches"][0]["score"],
+            result["matches"][1]["score"],
+        )
+        self.assertGreater(
+            result["matches"][1]["score"],
+            result["matches"][2]["score"],
+        )
         self.assertNotIn("key", result["matches"][0])
         self.assertNotIn("title", result["matches"][0])
         self.assertNotIn("itemType", result["matches"][0])
@@ -2214,7 +2225,6 @@ class SearchBehaviorTests(DbTestCase):
         )
         self.assertEqual(result["matches"], [])
         self.assertEqual(result["total"], 0)
-        self.assertEqual(db._search_state.retriever.calls, [])
 
     def test_search_within_item_zero_limit_still_returns_empty_query_warning(self):
         self._install_search_state([
@@ -2241,7 +2251,6 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["matches"], [])
         self.assertEqual(result["total"], 0)
         self.assertEqual(result["warning"], db._EMPTY_QUERY_WARNING)
-        self.assertEqual(db._search_state.retriever.calls, [])
 
     def test_search_within_item_returns_lean_item_summary_when_query_has_no_terms(self):
         self._install_search_state([
@@ -2272,7 +2281,6 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["limit_cap"], db._SEARCH_WITHIN_RESULT_LIMIT_CAP)
         self.assertFalse(result["limit_capped"])
         self.assertEqual(result["warning"], db._EMPTY_QUERY_WARNING)
-        self.assertEqual(db._search_state.retriever.calls, [])
 
     def test_search_within_item_does_not_return_warning_for_valid_zero_match_query(self):
         self._install_search_state([
@@ -2383,7 +2391,7 @@ class SearchBehaviorTests(DbTestCase):
                 "char_start": 0,
                 "char_end": 20,
                 "token_count": 3,
-                "text": "query match second",
+                "text": "query query query match second",
                 "text_hash": "hash-2",
             }, 8.0),
             ({
@@ -2395,7 +2403,7 @@ class SearchBehaviorTests(DbTestCase):
                 "char_start": 0,
                 "char_end": 20,
                 "token_count": 3,
-                "text": "query match first attachment",
+                "text": "query query match first attachment",
                 "text_hash": "hash-3",
             }, 7.5),
             ({
@@ -2424,34 +2432,15 @@ class SearchBehaviorTests(DbTestCase):
 
         self.assertEqual(result["item_keys"], ["PARENT1", "PARENT2", "PARENT3"])
         self.assertEqual(
-            result["items"],
-            [
-                {
-                    "key": "PARENT1",
-                    "title": "First Paper",
-                    "itemType": "preprint",
-                    "returned_match_count": 2,
-                    "top_score": 7.5,
-                    "top_match_type": "attachment_chunk",
-                },
-                {
-                    "key": "PARENT2",
-                    "title": "Second Paper",
-                    "itemType": "preprint",
-                    "returned_match_count": 1,
-                    "top_score": 8.0,
-                    "top_match_type": "metadata",
-                },
-                {
-                    "key": "PARENT3",
-                    "title": "Third Paper",
-                    "itemType": "preprint",
-                    "returned_match_count": 0,
-                    "top_score": None,
-                    "top_match_type": None,
-                },
-            ],
+            [item["returned_match_count"] for item in result["items"]],
+            [2, 1, 0],
         )
+        self.assertEqual(
+            [item["top_match_type"] for item in result["items"]],
+            ["attachment_chunk", "metadata", None],
+        )
+        self.assertGreater(result["items"][1]["top_score"], result["items"][0]["top_score"])
+        self.assertIsNone(result["items"][2]["top_score"])
         self.assertEqual(result["requested_limit"], 3)
         self.assertEqual(result["applied_limit"], 3)
         self.assertEqual(result["limit_cap"], db._SEARCH_WITHIN_RESULT_LIMIT_CAP)
@@ -2489,23 +2478,9 @@ class SearchBehaviorTests(DbTestCase):
         self.assertTrue(result["limit_capped"])
         self.assertEqual(result["total"], db._SEARCH_WITHIN_RESULT_LIMIT_CAP)
         self.assertEqual(len(result["matches"]), db._SEARCH_WITHIN_RESULT_LIMIT_CAP)
-        self.assertEqual(db._search_state.retriever.calls[0]["k"], 500)
 
 
-class SnapshotLifecycleTests(DbTestCase):
-    def test_streaming_vocabulary_reader_handles_chunk_boundaries_and_escapes(self):
-        long_token = "x" * (1024 * 1024 + 17)
-        vocabulary = {
-            long_token: 123456789,
-            "quoted\"token\\with\nnewline": 2,
-            "语言": 3,
-            "": 4,
-        }
-        path = Path(self.temp_dir.name) / "vocabulary.json"
-        path.write_text(json.dumps(vocabulary, ensure_ascii=False), encoding="utf-8")
-
-        self.assertEqual(dict(db._iter_json_object_items(path)), vocabulary)
-
+class FtsLifecycleTests(DbTestCase):
     def _make_parent(self, parent_key="PARENT1"):
         return db._ParentRecord(
             parent_key=parent_key,
@@ -2544,6 +2519,26 @@ class SnapshotLifecycleTests(DbTestCase):
             total_chars=None,
             source_signature=signature,
         )
+
+    def _make_doc(
+        self,
+        text: str,
+        *,
+        doc_id: str = "chunk:ATTACH1:0",
+        attachment_key: str = "ATTACH1",
+    ):
+        return {
+            "doc_id": doc_id,
+            "parent_key": "PARENT1",
+            "attachment_key": attachment_key,
+            "doc_kind": "metadata" if not attachment_key else "attachment_chunk",
+            "chunk_index": 0,
+            "char_start": 0,
+            "char_end": len(text),
+            "token_count": len(text.split()),
+            "text": text,
+            "text_hash": f"hash-{text}",
+        }
 
     def _create_minimal_source_library(self):
         with closing(sqlite3.connect(db._ZOTERO_DB)) as conn:
@@ -2666,25 +2661,63 @@ class SnapshotLifecycleTests(DbTestCase):
         )
         self.assertEqual(mock_conn.row_factory, sqlite3.Row)
 
-    def test_prepare_search_index_loads_existing_snapshot_and_skips_refresh(self):
-        parent = self._make_parent()
-        doc = db._build_metadata_doc(parent)
-        self.assertIsNotNone(doc)
+    def test_fts_initialization_reports_missing_runtime_support(self):
+        conn = Mock()
+        conn.execute.side_effect = sqlite3.OperationalError("no such module: fts5")
 
+        with self.assertRaisesRegex(RuntimeError, "FTS5 support is required"):
+            db._create_fts_objects(conn)
+
+    def test_cold_migration_populates_existing_docs_in_batches(self):
+        parent = self._make_parent()
         with closing(db._connect_manifest(writable=True)) as conn:
             db._initialize_manifest(conn)
             db._upsert_parent(conn, parent)
-            db._insert_doc(conn, doc)
-            snapshot_id, _ranked_doc_count = db._build_snapshot(
-                [doc],
-                source_fingerprint="fingerprint-1",
-                parent_count=1,
-                attachment_count=0,
+            conn.executescript(
+                """
+                DROP TRIGGER docs_fts_after_insert;
+                DROP TRIGGER docs_fts_after_delete;
+                DROP TRIGGER docs_fts_after_update;
+                DROP TABLE docs_fts;
+                DELETE FROM meta
+                WHERE key IN ('fts_schema_version', 'fts_index_status');
+                """
             )
-            db._set_meta(conn, "active_snapshot_id", snapshot_id)
+            for index in range(5):
+                db._insert_doc(
+                    conn,
+                    self._make_doc(
+                        f"migrationterm document {index}",
+                        doc_id=f"meta:PARENT1:{index}",
+                        attachment_key="",
+                    ),
+                )
             db._set_meta(conn, "last_source_fingerprint", "fingerprint-1")
             conn.commit()
 
+            with patch.object(db, "_FTS_MIGRATION_BATCH_SIZE", 2):
+                migrated_count = db._initialize_manifest(conn)
+
+            self.assertEqual(migrated_count, 5)
+            self.assertEqual(db._get_meta(conn, "fts_index_status"), "ready")
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM docs_fts WHERE docs_fts MATCH ?",
+                    (db._fts_match_expression("migrationterm"),),
+                ).fetchone()[0],
+                5,
+            )
+
+    def test_load_search_state_rejects_unpublished_empty_index(self):
+        with closing(db._connect_manifest(writable=True)) as conn:
+            db._initialize_manifest(conn)
+            conn.commit()
+
+        self.assertIsNone(db._load_search_state())
+
+    def test_prepare_search_index_loads_existing_fts_and_skips_refresh(self):
+        doc = self._make_doc("alpha beta", doc_id="meta:PARENT1", attachment_key="")
+        self._install_search_state([(doc, 1.0)])
         db._search_state = None
 
         with (
@@ -2694,78 +2727,12 @@ class SnapshotLifecycleTests(DbTestCase):
             db.prepare_search_index()
 
         self.assertIsNotNone(db._search_state)
-        self.assertEqual(db._search_state.snapshot_id, snapshot_id)
-        self.assertIn("PARENT1", db._search_state.parents)
-        refresh_mock.assert_not_called()
-
-    def test_prepare_search_index_holds_lock_during_snapshot_load(self):
-        parent = self._make_parent()
-        doc = db._build_metadata_doc(parent)
-        self.assertIsNotNone(doc)
-
-        with closing(db._connect_manifest(writable=True)) as conn:
-            db._initialize_manifest(conn)
-            db._upsert_parent(conn, parent)
-            db._insert_doc(conn, doc)
-            snapshot_id, _ranked_doc_count = db._build_snapshot(
-                [doc],
-                source_fingerprint="fingerprint-1",
-                parent_count=1,
-                attachment_count=0,
-            )
-            db._set_meta(conn, "active_snapshot_id", snapshot_id)
-            db._set_meta(conn, "last_source_fingerprint", "fingerprint-1")
-            conn.commit()
-
-        db._search_state = None
-
-        load_started = threading.Event()
-        release_load = threading.Event()
-        real_load_snapshot = db._load_snapshot
-
-        def slow_load(snapshot_to_load):
-            load_started.set()
-            release_load.wait(timeout=1)
-            return real_load_snapshot(snapshot_to_load)
-
-        with (
-            patch("zoty.db._compute_source_fingerprint", return_value="fingerprint-1"),
-            patch("zoty.db._start_refresh_thread") as refresh_mock,
-            patch("zoty.db._load_snapshot", side_effect=slow_load),
-        ):
-            thread = threading.Thread(target=db.prepare_search_index)
-            thread.start()
-            self.assertTrue(load_started.wait(timeout=1))
-            acquired = db._index_lock.acquire(blocking=False)
-            if acquired:
-                db._index_lock.release()
-            self.assertFalse(acquired)
-            release_load.set()
-            thread.join(timeout=1)
-
-        self.assertFalse(thread.is_alive())
-        self.assertIsNotNone(db._search_state)
-        self.assertEqual(db._search_state.snapshot_id, snapshot_id)
+        self.assertEqual(db._search_state.document_count, 1)
         refresh_mock.assert_not_called()
 
     def test_prepare_search_index_requests_refresh_when_fingerprint_changes(self):
-        parent = self._make_parent()
-        doc = db._build_metadata_doc(parent)
-
-        with closing(db._connect_manifest(writable=True)) as conn:
-            db._initialize_manifest(conn)
-            db._upsert_parent(conn, parent)
-            db._insert_doc(conn, doc)
-            snapshot_id, _ranked_doc_count = db._build_snapshot(
-                [doc],
-                source_fingerprint="fingerprint-1",
-                parent_count=1,
-                attachment_count=0,
-            )
-            db._set_meta(conn, "active_snapshot_id", snapshot_id)
-            db._set_meta(conn, "last_source_fingerprint", "fingerprint-1")
-            conn.commit()
-
+        doc = self._make_doc("alpha beta", doc_id="meta:PARENT1", attachment_key="")
+        self._install_search_state([(doc, 1.0)])
         db._search_state = None
 
         with (
@@ -2776,36 +2743,27 @@ class SnapshotLifecycleTests(DbTestCase):
 
         refresh_mock.assert_called_once_with(force=False)
 
-    def test_refresh_worker_builds_snapshot_and_mapped_load_preserves_results(self):
+    def test_refresh_worker_builds_fts_and_restart_preserves_results(self):
         self._create_minimal_source_library()
 
         return_code = db._run_refresh_worker_process()
 
         self.assertEqual(return_code, 0)
-        snapshot_id = db._active_snapshot_id()
-        mapped_state = db._load_snapshot(snapshot_id)
-        self.assertIsNotNone(mapped_state)
-        self.assertIsNotNone(mapped_state.retriever)
-        self.assertIsInstance(mapped_state.corpus_docs, db._ThreadSafeCorpus)
-        self.assertEqual(type(mapped_state.corpus_docs._corpus).__name__, "JsonlCorpus")
-        self.assertEqual(type(mapped_state.retriever.scores["data"]).__name__, "memmap")
-        self.assertIsInstance(mapped_state.retriever.vocab_dict, db._SqliteVocabulary)
-        self.assertIsNone(mapped_state.retriever.unique_token_ids_set)
-        self.assertEqual(len(mapped_state.doc_parent_ids), len(mapped_state.corpus_docs))
-        self.assertEqual(mapped_state.doc_parent_keys, ["PARENT1"])
-
-        db._install_state(mapped_state)
-        mapped_search = json.loads(db.search("alpha beta"))
-        mapped_within = json.loads(
+        state = db._load_search_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state.document_count, 1)
+        db._install_state(state)
+        initial_search = json.loads(db.search("alpha beta"))
+        initial_within = json.loads(
             db.search_within_item("", "alpha beta", item_keys=["PARENT1"]),
         )
         concurrent_results: list[dict | None] = [None] * 8
 
-        def run_mapped_search(index):
+        def run_search(index):
             concurrent_results[index] = json.loads(db.search("alpha beta"))
 
         threads = [
-            threading.Thread(target=run_mapped_search, args=(index,))
+            threading.Thread(target=run_search, args=(index,))
             for index in range(len(concurrent_results))
         ]
         for thread in threads:
@@ -2814,110 +2772,32 @@ class SnapshotLifecycleTests(DbTestCase):
             thread.join(timeout=2)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertTrue(all(result == mapped_search for result in concurrent_results))
+        self.assertTrue(all(result == initial_search for result in concurrent_results))
 
-        bm25_dir = db._snapshots_dir() / snapshot_id / "bm25"
-        eager_retriever = bm25s.BM25.load(bm25_dir, load_corpus=True)
-        eager_state = db._SearchState(
-            snapshot_id=snapshot_id,
-            source_fingerprint=mapped_state.source_fingerprint,
-            retriever=eager_retriever,
-            corpus_docs=list(eager_retriever.corpus),
-            parents=mapped_state.parents,
-        )
-        db._install_state(eager_state)
-        eager_search = json.loads(db.search("alpha beta"))
-        eager_within = json.loads(
+        db._search_state = None
+        with (
+            patch("zoty.db._compute_source_fingerprint", return_value=state.source_fingerprint),
+            patch("zoty.db._start_refresh_thread") as refresh_mock,
+        ):
+            db.prepare_search_index()
+
+        restarted_search = json.loads(db.search("alpha beta"))
+        restarted_within = json.loads(
             db.search_within_item("", "alpha beta", item_keys=["PARENT1"]),
         )
-
-        self.assertEqual(mapped_search, eager_search)
-        self.assertEqual(mapped_within, eager_within)
-        self.assertEqual(mapped_search["items"][0]["key"], "PARENT1")
-        self.assertEqual(mapped_within["matches"][0]["match_type"], "metadata")
-
-        mapped_state.corpus_docs.close()
-
-    def test_load_snapshot_prepares_legacy_lookup_files_in_worker(self):
-        parent = self._make_parent()
-        doc = db._build_metadata_doc(parent)
-        with closing(db._connect_manifest(writable=True)) as conn:
-            db._initialize_manifest(conn)
-            db._upsert_parent(conn, parent)
-            db._insert_doc(conn, doc)
-            snapshot_id, _ranked_doc_count = db._build_snapshot(
-                [doc],
-                source_fingerprint="fingerprint-1",
-                parent_count=1,
-                attachment_count=0,
-            )
-            conn.commit()
-
-        snapshot_dir = db._snapshots_dir() / snapshot_id
-        vocabulary_path = snapshot_dir / "bm25" / db._VOCABULARY_DB_FILENAME
-        metadata_path = snapshot_dir / db._CORPUS_METADATA_FILENAME
-        vocabulary_path.unlink()
-        metadata_path.unlink()
-
-        state = db._load_snapshot(snapshot_id)
-
-        self.assertIsNotNone(state)
-        self.assertTrue(vocabulary_path.exists())
-        self.assertTrue(metadata_path.exists())
-        self.assertIsInstance(state.retriever.vocab_dict, db._SqliteVocabulary)
-        self.assertEqual(state.doc_parent_keys, ["PARENT1"])
-        state.corpus_docs.close()
-        state.retriever.vocab_dict.close()
-
-    def test_thread_safe_corpus_serializes_lazy_mmap_reads(self):
-        class CursorCorpus:
-            def __init__(self):
-                self.active_reads = 0
-                self.max_active_reads = 0
-
-            def __len__(self):
-                return 1
-
-            def __getitem__(self, index):
-                self.active_reads += 1
-                self.max_active_reads = max(self.max_active_reads, self.active_reads)
-                time.sleep(0.02)
-                self.active_reads -= 1
-                return {"index": index}
-
-        cursor_corpus = CursorCorpus()
-        corpus = db._ThreadSafeCorpus(cursor_corpus)
-        threads = [threading.Thread(target=lambda: corpus[0]) for _ in range(4)]
-
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=1)
-
-        self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertEqual(cursor_corpus.max_active_reads, 1)
+        self.assertEqual(initial_search, restarted_search)
+        self.assertEqual(initial_within, restarted_within)
+        self.assertEqual(restarted_search["items"][0]["key"], "PARENT1")
+        self.assertEqual(restarted_within["matches"][0]["match_type"], "metadata")
+        refresh_mock.assert_not_called()
 
     def test_build_index_background_keeps_old_state_available_until_worker_finishes(self):
-        doc = {
-            "doc_id": "meta:PARENT1",
-            "parent_key": "PARENT1",
-            "attachment_key": "",
-            "doc_kind": "metadata",
-            "chunk_index": 0,
-            "char_start": 0,
-            "char_end": 16,
-            "token_count": 2,
-            "text": "alpha beta",
-            "text_hash": "hash-doc",
-        }
+        doc = self._make_doc("alpha beta", doc_id="meta:PARENT1", attachment_key="")
         self._install_search_state([(doc, 5.0)])
         old_state = db._search_state
         new_state = db._SearchState(
-            snapshot_id="snapshot-2",
             source_fingerprint="fingerprint-2",
-            retriever=FakeRetriever([(doc, 6.0)]),
-            corpus_docs=[doc],
-            parents=old_state.parents,
+            document_count=1,
         )
         worker_started = threading.Event()
         release_worker = threading.Event()
@@ -2929,9 +2809,8 @@ class SnapshotLifecycleTests(DbTestCase):
 
         db._refresh_in_progress = True
         with (
-            patch("zoty.db._active_snapshot_id", side_effect=["snapshot-1", "snapshot-2"]),
             patch("zoty.db._run_refresh_worker_process", side_effect=run_worker),
-            patch("zoty.db._load_snapshot", return_value=new_state),
+            patch("zoty.db._load_search_state", return_value=new_state),
             patch("zoty.db._get_item_attachment_counts", return_value={"PARENT1": 0}),
         ):
             refresh_thread = threading.Thread(target=db.build_index_background)
@@ -2955,8 +2834,8 @@ class SnapshotLifecycleTests(DbTestCase):
         db._refresh_in_progress = True
 
         with (
-            patch("zoty.db._active_snapshot_id", return_value="snapshot-1"),
             patch("zoty.db._run_refresh_worker_process", return_value=-9),
+            patch("zoty.db._load_search_state", return_value=old_state),
             patch("zoty.db._record_refresh_failure") as failure_mock,
             patch("sys.stderr", new_callable=io.StringIO),
         ):
@@ -2973,12 +2852,12 @@ class SnapshotLifecycleTests(DbTestCase):
 
         with closing(db._connect_manifest(writable=True)) as conn:
             db._initialize_manifest(conn)
-            db._set_meta(conn, "active_snapshot_id", "snapshot-1")
             db._set_meta(conn, "last_refresh_status", "failed: worker detail")
             conn.commit()
 
         with (
             patch("zoty.db._run_refresh_worker_process", return_value=1),
+            patch("zoty.db._load_search_state", return_value=old_state),
             patch("zoty.db._record_refresh_failure") as failure_mock,
             patch("sys.stderr", new_callable=io.StringIO),
         ):
@@ -2988,7 +2867,7 @@ class SnapshotLifecycleTests(DbTestCase):
         self.assertFalse(db._refresh_in_progress)
         failure_mock.assert_not_called()
 
-    def test_refresh_docs_manifest_reuses_unchanged_attachment_docs(self):
+    def test_incremental_refresh_handles_noop_edit_attachment_delete_and_parent_delete(self):
         parent = self._make_parent()
         attachment = self._make_attachment(signature="sig-1")
         ingested = db._AttachmentIngestResult(
@@ -3008,71 +2887,146 @@ class SnapshotLifecycleTests(DbTestCase):
                     "char_start": 0,
                     "char_end": 50,
                     "token_count": 20,
-                    "text": "alpha beta gamma",
+                    "text": "legacytoken attachment text",
                     "text_hash": "hash-doc",
                 }
             ],
+        )
+        changed_ingest = db._AttachmentIngestResult(
+            extraction_state="indexed",
+            error_text="",
+            content_hash="changed-content-hash",
+            content_chars=120,
+            token_count=3,
+            chunk_count=1,
+            docs=[self._make_doc("freshterm attachment text")],
         )
 
         with closing(db._connect_manifest(writable=True)) as conn:
             db._initialize_manifest(conn)
             with patch("zoty.db._ingest_attachment", return_value=ingested) as ingest_mock:
-                db._refresh_docs_manifest(conn, {"PARENT1": parent}, {"ATTACH1": attachment})
+                changed_count = db._refresh_docs_manifest(
+                    conn,
+                    {"PARENT1": parent},
+                    {"ATTACH1": attachment},
+                )
+                conn.commit()
                 self.assertEqual(ingest_mock.call_count, 1)
+                self.assertEqual(changed_count, 2)
 
             with patch("zoty.db._ingest_attachment", return_value=ingested) as ingest_mock:
-                db._refresh_docs_manifest(conn, {"PARENT1": parent}, {"ATTACH1": attachment})
+                changed_count = db._refresh_docs_manifest(
+                    conn,
+                    {"PARENT1": parent},
+                    {"ATTACH1": attachment},
+                )
+                conn.commit()
                 self.assertEqual(ingest_mock.call_count, 0)
+                self.assertEqual(changed_count, 0)
 
             changed_attachment = self._make_attachment(signature="sig-2")
-            with patch("zoty.db._ingest_attachment", return_value=ingested) as ingest_mock:
-                db._refresh_docs_manifest(conn, {"PARENT1": parent}, {"ATTACH1": changed_attachment})
-                self.assertEqual(ingest_mock.call_count, 1)
-
-    def test_prune_snapshots_keeps_active_and_previous_only(self):
-        snapshots_dir = db._snapshots_dir()
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("snap-1", "snap-2", "snap-3"):
-            (snapshots_dir / name).mkdir(parents=True, exist_ok=True)
-
-        db._prune_snapshots("snap-3", "snap-2")
-
-        self.assertTrue((snapshots_dir / "snap-3").exists())
-        self.assertTrue((snapshots_dir / "snap-2").exists())
-        self.assertFalse((snapshots_dir / "snap-1").exists())
-
-    def test_prune_snapshots_waits_for_index_lock(self):
-        snapshots_dir = db._snapshots_dir()
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("snap-1", "snap-2", "snap-3"):
-            (snapshots_dir / name).mkdir(parents=True, exist_ok=True)
-
-        delete_started = threading.Event()
-        release_delete = threading.Event()
-        real_rmtree = db.shutil.rmtree
-
-        def blocking_rmtree(path, ignore_errors=False):
-            delete_started.set()
-            release_delete.wait(timeout=1)
-            return real_rmtree(path, ignore_errors=ignore_errors)
-
-        with patch("zoty.db.shutil.rmtree", side_effect=blocking_rmtree):
-            with db._index_lock:
-                thread = threading.Thread(
-                    target=db._prune_snapshots,
-                    args=("snap-3", "snap-2"),
+            with patch("zoty.db._ingest_attachment", return_value=changed_ingest) as ingest_mock:
+                changed_count = db._refresh_docs_manifest(
+                    conn,
+                    {"PARENT1": parent},
+                    {"ATTACH1": changed_attachment},
                 )
-                thread.start()
-                self.assertFalse(delete_started.wait(timeout=0.1))
-                self.assertTrue((snapshots_dir / "snap-1").exists())
-                release_delete.set()
+                conn.commit()
+                self.assertEqual(ingest_mock.call_count, 1)
+                self.assertEqual(changed_count, 1)
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM docs_fts WHERE docs_fts MATCH 'legacytoken'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM docs_fts WHERE docs_fts MATCH 'freshterm'"
+                    ).fetchone()[0],
+                    1,
+                )
 
-            thread.join(timeout=1)
+            changed_count = db._refresh_docs_manifest(
+                conn,
+                {"PARENT1": parent},
+                {},
+            )
+            conn.commit()
+            self.assertEqual(changed_count, 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM docs_fts WHERE docs_fts MATCH 'freshterm'"
+                ).fetchone()[0],
+                0,
+            )
 
-        self.assertFalse(thread.is_alive())
-        self.assertTrue((snapshots_dir / "snap-3").exists())
-        self.assertTrue((snapshots_dir / "snap-2").exists())
-        self.assertFalse((snapshots_dir / "snap-1").exists())
+            changed_count = db._refresh_docs_manifest(conn, {}, {})
+            conn.commit()
+            self.assertEqual(changed_count, 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0], 0)
+
+    def test_search_keeps_a_read_snapshot_during_incremental_commit(self):
+        doc = self._make_doc("alpha original", doc_id="meta:PARENT1", attachment_key="")
+        self._install_search_state([(doc, 1.0)])
+        read_started = threading.Event()
+        release_read = threading.Event()
+        result_holder: list[dict | None] = [None]
+        real_load_parent_state = db._load_parent_state
+
+        def pause_after_parent_read(conn):
+            parents = real_load_parent_state(conn)
+            read_started.set()
+            release_read.wait(timeout=2)
+            return parents
+
+        def run_search():
+            result_holder[0] = json.loads(db.search("alpha"))
+
+        with (
+            patch("zoty.db._load_parent_state", side_effect=pause_after_parent_read),
+            patch("zoty.db._get_item_attachment_counts", return_value={"PARENT1": 0}),
+        ):
+            search_thread = threading.Thread(target=run_search)
+            search_thread.start()
+            self.assertTrue(read_started.wait(timeout=1))
+
+            with closing(db._connect_manifest(writable=True)) as conn:
+                db._insert_doc(
+                    conn,
+                    self._make_doc("beta replacement", doc_id="meta:PARENT1", attachment_key=""),
+                )
+                conn.commit()
+
+            release_read.set()
+            search_thread.join(timeout=2)
+
+        self.assertFalse(search_thread.is_alive())
+        self.assertEqual(result_holder[0]["total"], 1)
+        self.assertEqual(json.loads(db.search("alpha"))["total"], 0)
+        self.assertEqual(json.loads(db.search("beta"))["total"], 1)
+
+    def test_query_quoting_handles_punctuation_underscores_and_unicode(self):
+        doc = self._make_doc(
+            "C++ foo-bar naïve café 中文测试 alpha_beta email@example.com",
+            doc_id="meta:PARENT1",
+            attachment_key="",
+        )
+        self._install_search_state([(doc, 1.0)])
+
+        for query in (
+            "C++ foo-bar",
+            "naïve café",
+            "中文测试",
+            "alpha_beta",
+            'foo:"bar"*) OR NOT',
+        ):
+            with self.subTest(query=query):
+                result = json.loads(db.search(query))
+                self.assertNotIn("error", result)
+                self.assertEqual(result["total"], 1)
+
+        self.assertEqual(json.loads(db.search("naive cafe"))["total"], 0)
 
 
 class CitationEntryTests(DbTestCase):

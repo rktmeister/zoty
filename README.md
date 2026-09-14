@@ -6,7 +6,7 @@ Lightweight Zotero MCP server for AI agents.
 
 ## What it does
 
-MCP server that connects AI agents to your local Zotero library. Provides 8 tools: BM25-ranked search over titles, abstracts, and indexed attachment full text, within-item passage search, collection browsing, item lookup, BibTeX plus formatted citation export for item keys returned by search, and paper ingestion by arXiv ID or DOI with automatic PDF attachment.
+MCP server that connects AI agents to your local Zotero library. Provides 8 tools: SQLite FTS5-ranked search over titles, abstracts, and indexed attachment full text, within-item passage search, collection browsing, item lookup, BibTeX plus formatted citation export for item keys returned by search, and paper ingestion by arXiv ID or DOI with automatic PDF attachment.
 
 ## Requirements
 
@@ -15,9 +15,9 @@ MCP server that connects AI agents to your local Zotero library. Provides 8 tool
 - Zotero local API enabled: Zotero Settings > Advanced > Config Editor > set `extensions.zotero.httpServer.localAPI.enabled` to `true`
 - [Zoty Bridge plugin](#zoty-bridge-plugin) installed (for PDF attachment and collection assignment)
 
-This fork pins FastMCP `4.0.0b3`, the beta release that serves the MCP
-2026-07-28 sessionless protocol alongside legacy MCP clients. The exact pin is
-intentional while FastMCP 4 is in beta.
+This fork pins FastMCP `4.0.3`, which serves the MCP 2026-07-28 sessionless
+protocol alongside legacy MCP clients. The exact pin keeps transport behavior
+reproducible across installs.
 
 ## Add to Your Agent
 
@@ -185,7 +185,7 @@ The bridge runs an HTTP server on `localhost:24119` when Zotero is open. No conf
 
 | Tool | Description |
 |------|-------------|
-| `search_library` | Find which items in your Zotero library match a keyword query, ranked by BM25 over title, abstract, and indexed attachment full text, with optional plain-text snippets, attachment counts, collection filtering, collection key/name pairs, and case-insensitive item type values like `journalArticle`, `preprint`, `conferencePaper`, `book`, `bookSection`, `thesis`, `report`, and `webpage` |
+| `search_library` | Find which items in your Zotero library match a keyword query, ranked by SQLite FTS5 over title, abstract, and indexed attachment full text, with optional plain-text snippets, attachment counts, collection filtering, collection key/name pairs, and case-insensitive item type values like `journalArticle`, `preprint`, `conferencePaper`, `book`, `bookSection`, `thesis`, `report`, and `webpage` |
 | `search_within_item` | Find which passages within one or more known items match a keyword query, using `search_library` results to drill into a specific paper or compare several papers; top-level item summaries carry parent titles, and per-match parent `key` is only repeated for multi-item ranking |
 | `list_collections` | List all collections with keys, names, and item counts |
 | `list_collection_items` | List items in a specific collection, including collection key/name pairs on each item |
@@ -198,7 +198,9 @@ Attachment payloads include `linkMode` as a descriptive string (`imported_file`,
 
 ## How it works
 
-Read operations still use [pyzotero](https://github.com/urschrei/pyzotero) for collection/item APIs, but search now runs off a persistent sidecar index under `~/.cache/zoty/fulltext-index`. zoty reads Zotero metadata from `zotero.sqlite` in immutable mode, reuses Zotero's extracted attachment text caches (`.zotero-ft-cache`) for PDF/EPUB/HTML full text, chunks that text locally, and rebuilds immutable BM25 snapshots in a short-lived background process. At startup zoty memory-maps the active snapshot and uses a compact SQLite vocabulary instead of loading the full vocabulary JSON into a Python dictionary. Older snapshots get the compact lookup files once through a short-lived compatibility worker. Searches rank compact document IDs and read full corpus entries only for returned results. They keep using the previous snapshot until the new one is ready.
+Read operations still use [pyzotero](https://github.com/urschrei/pyzotero) for collection and item APIs, but search runs from a persistent SQLite FTS5 sidecar under `~/.cache/zoty/fulltext-index`. zoty reads Zotero metadata from `zotero.sqlite` in immutable mode, reuses Zotero's extracted attachment text caches (`.zotero-ft-cache`) for PDF, EPUB, and HTML full text, and chunks that text locally. A short-lived background process updates only documents whose source metadata or attachment text changed. Each update commits as one transaction, so concurrent searches keep reading the previous committed index until the new state is ready.
+
+On the first start after upgrading from the snapshot-based index, zoty streams the existing sidecar documents into FTS5 in bounded batches. Search remains unavailable until that one-time migration finishes. The old snapshot files are left in place for rollback, but zoty no longer loads or creates them. The Python SQLite runtime must include FTS5 support.
 
 Write operations use the Zotero connector endpoint (`/connector/saveItems`) to create metadata items. PDF attachment and collection assignment go through the zoty-bridge plugin, which executes JavaScript in Zotero's privileged context. The same bridge is used as a thin control plane to ask Zotero to generate missing full-text caches when needed; zoty does not add plugin-owned tables to `zotero.sqlite` or transfer raw attachment text through the bridge. This two-path design exists because Zotero's SQLite database uses exclusive locking -- external processes can read it (immutable mode) but not write to it while Zotero is running.
 

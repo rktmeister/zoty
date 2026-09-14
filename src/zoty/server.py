@@ -72,7 +72,7 @@ def search_library(
 ) -> str:
     """Find which items in your Zotero library match a keyword query.
 
-    Uses BM25 ranking over title, abstract, and indexed attachment full text.
+    Uses SQLite FTS5 ranking over title, abstract, and indexed attachment full text.
 
     Args:
         query: Search keywords (e.g. "transformer attention" not "what papers discuss attention?")
@@ -430,7 +430,7 @@ def _server_run_kwargs(args: argparse.Namespace) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Entry point: load the active snapshot, queue refresh work, and start MCP."""
+    """Entry point: load the committed FTS index, queue refresh work, and start MCP."""
     args = _parse_args(argv)
     db.prepare_search_index()
 
