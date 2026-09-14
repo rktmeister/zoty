@@ -40,8 +40,12 @@ class FakeRetriever:
             }
         )
         pairs = self._rows[:k]
+        documents = [
+            corpus[index] if corpus is not None else doc
+            for index, (doc, _score) in enumerate(pairs)
+        ]
         return (
-            FakeMatrix([[doc for doc, _score in pairs]]),
+            FakeMatrix([documents]),
             FakeMatrix([[score for _doc, score in pairs]]),
         )
 
@@ -143,12 +147,16 @@ class DbTestCase(unittest.TestCase):
                 }
             }
 
+        corpus_docs = [doc for doc, _score in docs]
+        parent_keys, doc_parent_ids = db._collect_corpus_parent_metadata(corpus_docs)
         db._search_state = db._SearchState(
             snapshot_id="snapshot-1",
             source_fingerprint="fingerprint-1",
             retriever=FakeRetriever([(doc, score) for doc, score in docs]),
-            corpus_docs=[doc for doc, _score in docs],
+            corpus_docs=corpus_docs,
             parents=parents,
+            doc_parent_ids=doc_parent_ids,
+            doc_parent_keys=parent_keys,
         )
 
 
@@ -1908,6 +1916,18 @@ class SearchBehaviorTests(DbTestCase):
         )
 
     def test_search_caps_large_requested_limits_and_reports_metadata(self):
+        class CountingCorpus:
+            def __init__(self, corpus_docs):
+                self.corpus_docs = corpus_docs
+                self.read_count = 0
+
+            def __len__(self):
+                return len(self.corpus_docs)
+
+            def __getitem__(self, index):
+                self.read_count += 1
+                return self.corpus_docs[index]
+
         parents = {}
         docs = []
         for index in range(600):
@@ -1943,6 +1963,8 @@ class SearchBehaviorTests(DbTestCase):
                 )
             )
         self._install_search_state(docs, parents=parents)
+        counting_corpus = CountingCorpus(db._search_state.corpus_docs)
+        db._search_state.corpus_docs = counting_corpus
 
         result = json.loads(db.search("query", limit=1000))
 
@@ -1954,6 +1976,10 @@ class SearchBehaviorTests(DbTestCase):
         self.assertEqual(result["returned_count"], db._SEARCH_RESULT_LIMIT_CAP)
         self.assertEqual(len(result["items"]), db._SEARCH_RESULT_LIMIT_CAP)
         self.assertEqual([call["k"] for call in db._search_state.retriever.calls], [500, 600])
+        self.assertTrue(
+            all(isinstance(call["corpus"], range) for call in db._search_state.retriever.calls)
+        )
+        self.assertEqual(counting_corpus.read_count, db._SEARCH_RESULT_LIMIT_CAP)
         self.assertEqual(result["items"][0]["key"], "PARENT1")
 
     def test_search_preserves_zero_requested_limit_while_reporting_total_matches(self):
@@ -2467,6 +2493,19 @@ class SearchBehaviorTests(DbTestCase):
 
 
 class SnapshotLifecycleTests(DbTestCase):
+    def test_streaming_vocabulary_reader_handles_chunk_boundaries_and_escapes(self):
+        long_token = "x" * (1024 * 1024 + 17)
+        vocabulary = {
+            long_token: 123456789,
+            "quoted\"token\\with\nnewline": 2,
+            "语言": 3,
+            "": 4,
+        }
+        path = Path(self.temp_dir.name) / "vocabulary.json"
+        path.write_text(json.dumps(vocabulary, ensure_ascii=False), encoding="utf-8")
+
+        self.assertEqual(dict(db._iter_json_object_items(path)), vocabulary)
+
     def _make_parent(self, parent_key="PARENT1"):
         return db._ParentRecord(
             parent_key=parent_key,
@@ -2750,12 +2789,32 @@ class SnapshotLifecycleTests(DbTestCase):
         self.assertIsInstance(mapped_state.corpus_docs, db._ThreadSafeCorpus)
         self.assertEqual(type(mapped_state.corpus_docs._corpus).__name__, "JsonlCorpus")
         self.assertEqual(type(mapped_state.retriever.scores["data"]).__name__, "memmap")
+        self.assertIsInstance(mapped_state.retriever.vocab_dict, db._SqliteVocabulary)
+        self.assertIsNone(mapped_state.retriever.unique_token_ids_set)
+        self.assertEqual(len(mapped_state.doc_parent_ids), len(mapped_state.corpus_docs))
+        self.assertEqual(mapped_state.doc_parent_keys, ["PARENT1"])
 
         db._install_state(mapped_state)
         mapped_search = json.loads(db.search("alpha beta"))
         mapped_within = json.loads(
             db.search_within_item("", "alpha beta", item_keys=["PARENT1"]),
         )
+        concurrent_results: list[dict | None] = [None] * 8
+
+        def run_mapped_search(index):
+            concurrent_results[index] = json.loads(db.search("alpha beta"))
+
+        threads = [
+            threading.Thread(target=run_mapped_search, args=(index,))
+            for index in range(len(concurrent_results))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertTrue(all(result == mapped_search for result in concurrent_results))
 
         bm25_dir = db._snapshots_dir() / snapshot_id / "bm25"
         eager_retriever = bm25s.BM25.load(bm25_dir, load_corpus=True)
@@ -2778,6 +2837,37 @@ class SnapshotLifecycleTests(DbTestCase):
         self.assertEqual(mapped_within["matches"][0]["match_type"], "metadata")
 
         mapped_state.corpus_docs.close()
+
+    def test_load_snapshot_prepares_legacy_lookup_files_in_worker(self):
+        parent = self._make_parent()
+        doc = db._build_metadata_doc(parent)
+        with closing(db._connect_manifest(writable=True)) as conn:
+            db._initialize_manifest(conn)
+            db._upsert_parent(conn, parent)
+            db._insert_doc(conn, doc)
+            snapshot_id, _ranked_doc_count = db._build_snapshot(
+                [doc],
+                source_fingerprint="fingerprint-1",
+                parent_count=1,
+                attachment_count=0,
+            )
+            conn.commit()
+
+        snapshot_dir = db._snapshots_dir() / snapshot_id
+        vocabulary_path = snapshot_dir / "bm25" / db._VOCABULARY_DB_FILENAME
+        metadata_path = snapshot_dir / db._CORPUS_METADATA_FILENAME
+        vocabulary_path.unlink()
+        metadata_path.unlink()
+
+        state = db._load_snapshot(snapshot_id)
+
+        self.assertIsNotNone(state)
+        self.assertTrue(vocabulary_path.exists())
+        self.assertTrue(metadata_path.exists())
+        self.assertIsInstance(state.retriever.vocab_dict, db._SqliteVocabulary)
+        self.assertEqual(state.doc_parent_keys, ["PARENT1"])
+        state.corpus_docs.close()
+        state.retriever.vocab_dict.close()
 
     def test_thread_safe_corpus_serializes_lazy_mmap_reads(self):
         class CursorCorpus:

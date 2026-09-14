@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import html
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -30,6 +32,8 @@ _ZOTERO_STORAGE = _ZOTERO_DIR / "storage"
 _ZOTERO_DB = _ZOTERO_DIR / "zotero.sqlite"
 _SIDECAR_ROOT = Path.home() / ".cache" / "zoty" / "fulltext-index"
 _SCHEMA_VERSION = "1"
+_CORPUS_METADATA_FILENAME = "corpus-metadata.json"
+_VOCABULARY_DB_FILENAME = "vocabulary.sqlite"
 _SKIP_TYPES = {"attachment", "note", "annotation"}
 _CACHE_CONTENT_TYPES = {
     "application/epub+zip",
@@ -112,6 +116,8 @@ class _SearchState:
     retriever: bm25s.BM25 | None
     corpus_docs: Sequence[dict[str, Any]]
     parents: dict[str, dict[str, Any]]
+    doc_parent_ids: Sequence[int] = ()
+    doc_parent_keys: Sequence[str] = ()
 
 
 class _ThreadSafeCorpus(Sequence[dict[str, Any]]):
@@ -132,6 +138,72 @@ class _ThreadSafeCorpus(Sequence[dict[str, Any]]):
         close_corpus = getattr(self._corpus, "close", None)
         if close_corpus is not None:
             close_corpus()
+
+
+class _SqliteVocabulary(Mapping[str, int]):
+    """Read token IDs from a compact, immutable SQLite database."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._cache: dict[str, int | None] = {}
+        self._connection: sqlite3.Connection | None = None
+        self._connection = sqlite3.connect(
+            f"file:{path}?mode=ro&immutable=1",
+            uri=True,
+            check_same_thread=False,
+        )
+        self._length = int(
+            self._connection.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
+        )
+
+    def _lookup(self, token: str) -> int | None:
+        with self._lock:
+            if token in self._cache:
+                return self._cache[token]
+            if self._connection is None:
+                raise RuntimeError("vocabulary database is closed")
+            row = self._connection.execute(
+                "SELECT token_id FROM vocabulary WHERE token = ?",
+                (token,),
+            ).fetchone()
+            token_id = int(row[0]) if row is not None else None
+            if len(self._cache) >= 4096:
+                self._cache.clear()
+            self._cache[token] = token_id
+            return token_id
+
+    def __getitem__(self, token: str) -> int:
+        token_id = self._lookup(token)
+        if token_id is None:
+            raise KeyError(token)
+        return token_id
+
+    def __contains__(self, token: object) -> bool:
+        return isinstance(token, str) and self._lookup(token) is not None
+
+    def __iter__(self):
+        with closing(
+            sqlite3.connect(f"file:{self._path}?mode=ro&immutable=1", uri=True)
+        ) as conn:
+            for row in conn.execute("SELECT token FROM vocabulary ORDER BY token"):
+                yield str(row[0])
+
+    def __len__(self) -> int:
+        return self._length
+
+    def close(self) -> None:
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+            self._cache.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 _index_lock = threading.Lock()
@@ -1608,6 +1680,198 @@ def _load_docs_for_snapshot(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return docs
 
 
+def _collect_corpus_parent_metadata(
+    docs: Iterable[dict[str, Any]],
+) -> tuple[list[str], list[int]]:
+    parent_keys: list[str] = []
+    parent_id_by_key: dict[str, int] = {}
+    doc_parent_ids: list[int] = []
+    for doc in docs:
+        parent_key = str(doc.get("parent_key", ""))
+        if not parent_key:
+            raise ValueError("ranked document is missing parent_key")
+        parent_id = parent_id_by_key.get(parent_key)
+        if parent_id is None:
+            parent_id = len(parent_keys)
+            parent_id_by_key[parent_key] = parent_id
+            parent_keys.append(parent_key)
+        doc_parent_ids.append(parent_id)
+    return parent_keys, doc_parent_ids
+
+
+def _write_corpus_parent_metadata(
+    snapshot_dir: Path,
+    docs: Iterable[dict[str, Any]],
+) -> None:
+    target_path = snapshot_dir / _CORPUS_METADATA_FILENAME
+    if target_path.exists():
+        return
+    parent_keys, doc_parent_ids = _collect_corpus_parent_metadata(docs)
+    temp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(
+                {
+                    "doc_parent_ids": doc_parent_ids,
+                    "parent_keys": parent_keys,
+                    "version": 1,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        temp_path.replace(target_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _iter_json_object_items(path: Path) -> Iterator[tuple[str, int]]:
+    """Read a string-to-integer JSON object without loading the whole file."""
+    decoder = json.JSONDecoder()
+    chunk_size = 1024 * 1024
+
+    with path.open(encoding="utf-8") as source:
+        buffer = ""
+        position = 0
+        eof = False
+
+        def refill() -> None:
+            nonlocal buffer, position, eof
+            chunk = source.read(chunk_size)
+            buffer = buffer[position:] + chunk
+            position = 0
+            eof = not chunk
+
+        def skip_whitespace() -> None:
+            nonlocal position
+            while True:
+                while position < len(buffer) and buffer[position].isspace():
+                    position += 1
+                if position < len(buffer) or eof:
+                    return
+                refill()
+
+        def decode_value() -> Any:
+            nonlocal position
+            while True:
+                skip_whitespace()
+                start = position
+                try:
+                    value, end = decoder.raw_decode(buffer, position)
+                except json.JSONDecodeError as exc:
+                    if eof:
+                        raise ValueError(f"invalid JSON object in {path}") from exc
+                    refill()
+                    continue
+                if end == len(buffer) and not eof:
+                    position = start
+                    refill()
+                    continue
+                position = end
+                return value
+
+        refill()
+        skip_whitespace()
+        if position >= len(buffer) or buffer[position] != "{":
+            raise ValueError(f"expected a JSON object in {path}")
+        position += 1
+
+        skip_whitespace()
+        if position < len(buffer) and buffer[position] == "}":
+            position += 1
+        else:
+            while True:
+                token = decode_value()
+                if not isinstance(token, str):
+                    raise ValueError(f"JSON object key is not a string in {path}")
+
+                skip_whitespace()
+                if position >= len(buffer) or buffer[position] != ":":
+                    raise ValueError(f"expected ':' after a JSON object key in {path}")
+                position += 1
+
+                token_id = decode_value()
+                if not isinstance(token_id, int) or isinstance(token_id, bool):
+                    raise ValueError(f"JSON object value is not an integer in {path}")
+                yield token, token_id
+
+                skip_whitespace()
+                if position >= len(buffer):
+                    raise ValueError(f"unterminated JSON object in {path}")
+                delimiter = buffer[position]
+                position += 1
+                if delimiter == "}":
+                    break
+                if delimiter != ",":
+                    raise ValueError(f"expected ',' or '}}' in {path}")
+
+        skip_whitespace()
+        if position < len(buffer):
+            raise ValueError(f"unexpected content after JSON object in {path}")
+
+
+def _build_compact_vocabulary(
+    bm25_dir: Path,
+    vocabulary: Mapping[str, int] | None = None,
+) -> None:
+    target_path = bm25_dir / _VOCABULARY_DB_FILENAME
+    if target_path.exists():
+        return
+    source_path = bm25_dir / "vocab.index.json"
+    if not source_path.exists():
+        raise FileNotFoundError(f"BM25 vocabulary was not found at {source_path}")
+
+    temp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.tmp")
+    temp_path.unlink(missing_ok=True)
+    try:
+        with closing(sqlite3.connect(temp_path)) as conn:
+            conn.execute("PRAGMA journal_mode = OFF")
+            conn.execute("PRAGMA synchronous = OFF")
+            conn.execute("PRAGMA cache_size = -32768")
+            conn.execute("PRAGMA temp_store = FILE")
+            conn.execute(
+                """CREATE TABLE vocabulary (
+                       token TEXT PRIMARY KEY,
+                       token_id INTEGER NOT NULL
+                   ) WITHOUT ROWID"""
+            )
+            if vocabulary is None:
+                conn.executemany(
+                    "INSERT INTO vocabulary(token, token_id) VALUES (?, ?)",
+                    _iter_json_object_items(source_path),
+                )
+            else:
+                sorted_tokens = sorted(vocabulary)
+                conn.executemany(
+                    "INSERT INTO vocabulary(token, token_id) VALUES (?, ?)",
+                    ((token, vocabulary[token]) for token in sorted_tokens),
+                )
+            conn.commit()
+        temp_path.replace(target_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def prepare_snapshot_for_low_memory(snapshot_dir: Path) -> None:
+    """Create compact lookup files for a snapshot built by an older Zoty."""
+    bm25_dir = snapshot_dir / "bm25"
+    if not bm25_dir.exists():
+        return
+    _build_compact_vocabulary(bm25_dir)
+
+    metadata_path = snapshot_dir / _CORPUS_METADATA_FILENAME
+    if metadata_path.exists():
+        return
+    corpus_path = bm25_dir / "corpus.jsonl"
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"BM25 corpus was not found at {corpus_path}")
+    with corpus_path.open(encoding="utf-8") as corpus_file:
+        docs = (json.loads(line) for line in corpus_file if line.strip())
+        _write_corpus_parent_metadata(snapshot_dir, docs)
+
+
 def _build_snapshot(
     docs: list[dict[str, Any]],
     *,
@@ -1642,6 +1906,11 @@ def _build_snapshot(
                 retriever = bm25s.BM25()
                 retriever.index(indexed_tokens, show_progress=False)
                 retriever.save(temp_dir / "bm25", corpus=indexed_docs)
+                _build_compact_vocabulary(
+                    temp_dir / "bm25",
+                    vocabulary=retriever.vocab_dict,
+                )
+                _write_corpus_parent_metadata(temp_dir, indexed_docs)
 
         snapshot_meta = {
             "attachment_count": attachment_count,
@@ -1687,6 +1956,85 @@ def _load_parent_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     return parents
 
 
+def _snapshot_needs_low_memory_artifacts(snapshot_dir: Path) -> bool:
+    bm25_dir = snapshot_dir / "bm25"
+    return bm25_dir.exists() and (
+        not (bm25_dir / _VOCABULARY_DB_FILENAME).exists()
+        or not (snapshot_dir / _CORPUS_METADATA_FILENAME).exists()
+    )
+
+
+def _ensure_snapshot_low_memory_artifacts(snapshot_dir: Path) -> None:
+    if not _snapshot_needs_low_memory_artifacts(snapshot_dir):
+        return
+    return_code = _run_snapshot_prepare_worker_process(snapshot_dir)
+    if return_code != 0:
+        print(
+            f"zoty: snapshot compatibility worker exited with status {return_code}; using the legacy loader",
+            file=sys.stderr,
+        )
+
+
+def _load_corpus_parent_metadata(
+    snapshot_dir: Path,
+    corpus_docs: Sequence[dict[str, Any]],
+) -> tuple[Sequence[str], Sequence[int]]:
+    metadata_path = snapshot_dir / _CORPUS_METADATA_FILENAME
+    if not metadata_path.exists():
+        return _collect_corpus_parent_metadata(corpus_docs)
+
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    parent_keys = payload.get("parent_keys")
+    doc_parent_ids = payload.get("doc_parent_ids")
+    if payload.get("version") != 1:
+        raise ValueError("unsupported corpus metadata version")
+    if not isinstance(parent_keys, list) or not all(
+        isinstance(parent_key, str) and parent_key
+        for parent_key in parent_keys
+    ):
+        raise ValueError("corpus metadata has invalid parent keys")
+    if not isinstance(doc_parent_ids, list) or len(doc_parent_ids) != len(corpus_docs):
+        raise ValueError("corpus metadata document count does not match the BM25 corpus")
+    if not all(
+        isinstance(parent_id, int) and 0 <= parent_id < len(parent_keys)
+        for parent_id in doc_parent_ids
+    ):
+        raise ValueError("corpus metadata has invalid parent IDs")
+    return parent_keys, doc_parent_ids
+
+
+def _load_bm25_snapshot(
+    bm25_dir: Path,
+) -> tuple[bm25s.BM25, Sequence[dict[str, Any]]]:
+    vocabulary_path = bm25_dir / _VOCABULARY_DB_FILENAME
+    if vocabulary_path.exists():
+        try:
+            retriever = bm25s.BM25.load(
+                bm25_dir,
+                load_corpus=True,
+                load_vocab=False,
+                mmap=True,
+            )
+            retriever.vocab_dict = _SqliteVocabulary(vocabulary_path)
+            retriever.unique_token_ids_set = None
+            lazy_corpus = getattr(retriever, "corpus", None)
+            if lazy_corpus is None:
+                raise RuntimeError("snapshot is missing its saved corpus")
+            return retriever, _ThreadSafeCorpus(lazy_corpus)
+        except Exception as exc:
+            print(
+                f"zoty: failed to load compact BM25 vocabulary: {exc}; using the legacy vocabulary",
+                file=sys.stderr,
+            )
+
+    retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
+    retriever.unique_token_ids_set = None
+    lazy_corpus = getattr(retriever, "corpus", None)
+    if lazy_corpus is None:
+        raise RuntimeError("snapshot is missing its saved corpus")
+    return retriever, _ThreadSafeCorpus(lazy_corpus)
+
+
 def _load_snapshot(snapshot_id: str) -> _SearchState | None:
     snapshot_dir = _snapshots_dir() / snapshot_id
     if not snapshot_dir.exists():
@@ -1704,14 +2052,17 @@ def _load_snapshot(snapshot_id: str) -> _SearchState | None:
 
     retriever: bm25s.BM25 | None = None
     corpus_docs: Sequence[dict[str, Any]] = ()
+    doc_parent_keys: Sequence[str] = ()
+    doc_parent_ids: Sequence[int] = ()
     bm25_dir = snapshot_dir / "bm25"
     if bm25_dir.exists():
         try:
-            retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
-            lazy_corpus = getattr(retriever, "corpus", None)
-            if lazy_corpus is None:
-                raise RuntimeError("snapshot is missing its saved corpus")
-            corpus_docs = _ThreadSafeCorpus(lazy_corpus)
+            _ensure_snapshot_low_memory_artifacts(snapshot_dir)
+            retriever, corpus_docs = _load_bm25_snapshot(bm25_dir)
+            doc_parent_keys, doc_parent_ids = _load_corpus_parent_metadata(
+                snapshot_dir,
+                corpus_docs,
+            )
         except Exception as exc:
             print(f"zoty: failed to load BM25 snapshot {snapshot_id}: {exc}", file=sys.stderr)
             return None
@@ -1729,6 +2080,8 @@ def _load_snapshot(snapshot_id: str) -> _SearchState | None:
         retriever=retriever,
         corpus_docs=corpus_docs,
         parents=parents,
+        doc_parent_ids=doc_parent_ids,
+        doc_parent_keys=doc_parent_keys,
     )
 
 
@@ -1736,6 +2089,26 @@ def _install_state(state: _SearchState) -> None:
     global _search_state
     with _index_lock:
         _search_state = state
+
+
+def _parent_key_for_ranked_doc(state: _SearchState, doc_index: int) -> str:
+    if state.doc_parent_ids and state.doc_parent_keys:
+        return state.doc_parent_keys[state.doc_parent_ids[doc_index]]
+    return str(state.corpus_docs[doc_index]["parent_key"])
+
+
+def _retrieve_ranked_doc_ids(
+    state: _SearchState,
+    query_tokens: Any,
+    *,
+    k: int,
+) -> tuple[Any, Any]:
+    return state.retriever.retrieve(
+        query_tokens,
+        corpus=range(len(state.corpus_docs)),
+        k=k,
+        show_progress=False,
+    )
 
 
 def _active_snapshot_id() -> str:
@@ -1884,6 +2257,16 @@ def run_index_refresh_worker() -> int:
     return 0
 
 
+def run_snapshot_prepare_worker(snapshot_dir: Path) -> int:
+    """Create low-memory lookup files for one existing snapshot."""
+    try:
+        prepare_snapshot_for_low_memory(snapshot_dir)
+    except Exception as exc:
+        print(f"zoty: failed to prepare snapshot lookup files: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _refresh_worker_command() -> list[str]:
     return [
         sys.executable,
@@ -1898,8 +2281,26 @@ def _refresh_worker_command() -> list[str]:
     ]
 
 
+def _snapshot_prepare_worker_command(snapshot_dir: Path) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "zoty._index_worker",
+        "--prepare-snapshot",
+        str(snapshot_dir),
+    ]
+
+
 def _run_refresh_worker_process() -> int:
     completed = subprocess.run(_refresh_worker_command(), check=False)
+    return completed.returncode
+
+
+def _run_snapshot_prepare_worker_process(snapshot_dir: Path) -> int:
+    completed = subprocess.run(
+        _snapshot_prepare_worker_command(snapshot_dir),
+        check=False,
+    )
     return completed.returncode
 
 
@@ -2372,20 +2773,19 @@ def search(
     best_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
 
     while batch_size > 0:
-        results, scores = state.retriever.retrieve(
+        ranked_doc_ids, scores = _retrieve_ranked_doc_ids(
+            state,
             query_tokens,
-            corpus=state.corpus_docs,
             k=batch_size,
-            show_progress=False,
         )
 
-        for index in range(results.shape[1]):
-            doc = results[0, index]
+        for index in range(ranked_doc_ids.shape[1]):
+            doc_index = int(ranked_doc_ids[0, index])
             score = float(scores[0, index])
             if score <= 0:
                 continue
 
-            parent_key = doc["parent_key"]
+            parent_key = _parent_key_for_ranked_doc(state, doc_index)
             parent = state.parents.get(parent_key)
             if not parent:
                 continue
@@ -2401,7 +2801,7 @@ def search(
                 best_by_identity[identity] = {
                     "parent_key": parent_key,
                     "score": score,
-                    "doc": doc,
+                    "doc_index": doc_index,
                     "preference": preference,
                 }
 
@@ -2434,11 +2834,12 @@ def search(
     results_payload = []
     for entry in returned_entries:
         parent_key = entry["parent_key"]
+        best_doc = state.corpus_docs[entry["doc_index"]]
         results_payload.append(
             _result_from_parent(
                 state.parents[parent_key],
                 score=entry["score"],
-                best_doc=entry["doc"],
+                best_doc=best_doc,
                 query_terms=query_terms,
                 attachment_count=attachment_counts.get(parent_key, 0),
                 attachments=attachments_by_parent.get(parent_key) if include_attachments else None,
@@ -2638,30 +3039,30 @@ def search_within_item(
     max_docs = len(state.corpus_docs)
     batch_size = min(max(applied_limit * 20, 200), max_docs)
     matches: list[dict[str, Any]] = []
-    seen_doc_ids: set[str] = set()
+    seen_doc_indices: set[int] = set()
     found_item_key_set = set(found_item_keys)
 
     while batch_size > 0:
-        results, scores = state.retriever.retrieve(
+        ranked_doc_ids, scores = _retrieve_ranked_doc_ids(
+            state,
             query_tokens,
-            corpus=state.corpus_docs,
             k=batch_size,
-            show_progress=False,
         )
 
         found_enough = False
-        for index in range(results.shape[1]):
-            doc = results[0, index]
+        for index in range(ranked_doc_ids.shape[1]):
+            doc_index = int(ranked_doc_ids[0, index])
             score = float(scores[0, index])
             if score <= 0:
                 continue
-            parent_key = doc["parent_key"]
+            parent_key = _parent_key_for_ranked_doc(state, doc_index)
             if parent_key not in found_item_key_set:
                 continue
-            if doc["doc_id"] in seen_doc_ids:
+            if doc_index in seen_doc_indices:
                 continue
 
-            seen_doc_ids.add(doc["doc_id"])
+            seen_doc_indices.add(doc_index)
+            doc = state.corpus_docs[doc_index]
             matches.append(_result_from_doc(
                 state.parents[parent_key],
                 score=score,
