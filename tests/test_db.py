@@ -9,6 +9,8 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import bm25s
+
 from zoty import db
 
 
@@ -2504,6 +2506,114 @@ class SnapshotLifecycleTests(DbTestCase):
             source_signature=signature,
         )
 
+    def _create_minimal_source_library(self):
+        with closing(sqlite3.connect(db._ZOTERO_DB)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE itemTypesCombined (
+                    itemTypeID INTEGER PRIMARY KEY,
+                    typeName TEXT NOT NULL
+                );
+                CREATE TABLE items (
+                    itemID INTEGER PRIMARY KEY,
+                    key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    dateModified TEXT NOT NULL,
+                    dateAdded TEXT NOT NULL,
+                    itemTypeID INTEGER NOT NULL,
+                    libraryID INTEGER
+                );
+                CREATE TABLE deletedItems (itemID INTEGER PRIMARY KEY);
+                CREATE TABLE itemAttachments (
+                    itemID INTEGER PRIMARY KEY,
+                    parentItemID INTEGER,
+                    contentType TEXT,
+                    linkMode INTEGER,
+                    path TEXT,
+                    storageModTime INTEGER,
+                    storageHash TEXT,
+                    lastProcessedModificationTime INTEGER
+                );
+                CREATE TABLE fulltextItems (
+                    itemID INTEGER PRIMARY KEY,
+                    version INTEGER,
+                    indexedPages INTEGER,
+                    totalPages INTEGER,
+                    indexedChars INTEGER,
+                    totalChars INTEGER
+                );
+                CREATE TABLE fields (
+                    fieldID INTEGER PRIMARY KEY,
+                    fieldName TEXT NOT NULL
+                );
+                CREATE TABLE itemDataValues (
+                    valueID INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE itemData (
+                    itemID INTEGER NOT NULL,
+                    fieldID INTEGER NOT NULL,
+                    valueID INTEGER NOT NULL
+                );
+                CREATE TABLE creators (
+                    creatorID INTEGER PRIMARY KEY,
+                    firstName TEXT,
+                    lastName TEXT,
+                    fieldMode INTEGER
+                );
+                CREATE TABLE itemCreators (
+                    itemID INTEGER NOT NULL,
+                    creatorID INTEGER NOT NULL,
+                    orderIndex INTEGER NOT NULL
+                );
+                CREATE TABLE collectionItems (
+                    itemID INTEGER NOT NULL,
+                    collectionID INTEGER NOT NULL,
+                    orderIndex INTEGER NOT NULL
+                );
+                CREATE TABLE tags (
+                    tagID INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE itemTags (
+                    itemID INTEGER NOT NULL,
+                    tagID INTEGER NOT NULL
+                );
+
+                INSERT INTO itemTypesCombined(itemTypeID, typeName) VALUES (1, 'preprint');
+                INSERT INTO items(
+                    itemID, key, version, dateModified, dateAdded, itemTypeID, libraryID
+                ) VALUES (
+                    1, 'PARENT1', 1, '2026-03-10 10:00:00', '2026-03-10 09:00:00', 1, 1
+                );
+                INSERT INTO fields(fieldID, fieldName) VALUES
+                    (1, 'title'),
+                    (2, 'abstractNote'),
+                    (3, 'date'),
+                    (4, 'DOI'),
+                    (5, 'url');
+                INSERT INTO itemDataValues(valueID, value) VALUES
+                    (1, 'Snapshot Paper'),
+                    (2, 'Snapshot abstract mentions alpha beta.'),
+                    (3, '2026-03-10'),
+                    (4, '10.1000/snapshot'),
+                    (5, 'https://example.org/snapshot');
+                INSERT INTO itemData(itemID, fieldID, valueID) VALUES
+                    (1, 1, 1),
+                    (1, 2, 2),
+                    (1, 3, 3),
+                    (1, 4, 4),
+                    (1, 5, 5);
+                INSERT INTO creators(creatorID, firstName, lastName, fieldMode)
+                    VALUES (1, 'Jane', 'Example', 0);
+                INSERT INTO itemCreators(itemID, creatorID, orderIndex) VALUES (1, 1, 0);
+                INSERT INTO collectionItems(itemID, collectionID, orderIndex) VALUES (1, 1, 0);
+                INSERT INTO tags(tagID, name) VALUES (1, 'chemistry');
+                INSERT INTO itemTags(itemID, tagID) VALUES (1, 1);
+                """
+            )
+            conn.commit()
+
     def test_connect_manifest_uses_read_only_uri_for_read_connections(self):
         mock_conn = Mock()
 
@@ -2526,7 +2636,7 @@ class SnapshotLifecycleTests(DbTestCase):
             db._initialize_manifest(conn)
             db._upsert_parent(conn, parent)
             db._insert_doc(conn, doc)
-            snapshot_id, _retriever, _corpus_docs = db._build_snapshot(
+            snapshot_id, _ranked_doc_count = db._build_snapshot(
                 [doc],
                 source_fingerprint="fingerprint-1",
                 parent_count=1,
@@ -2558,7 +2668,7 @@ class SnapshotLifecycleTests(DbTestCase):
             db._initialize_manifest(conn)
             db._upsert_parent(conn, parent)
             db._insert_doc(conn, doc)
-            snapshot_id, _retriever, _corpus_docs = db._build_snapshot(
+            snapshot_id, _ranked_doc_count = db._build_snapshot(
                 [doc],
                 source_fingerprint="fingerprint-1",
                 parent_count=1,
@@ -2607,7 +2717,7 @@ class SnapshotLifecycleTests(DbTestCase):
             db._initialize_manifest(conn)
             db._upsert_parent(conn, parent)
             db._insert_doc(conn, doc)
-            snapshot_id, _retriever, _corpus_docs = db._build_snapshot(
+            snapshot_id, _ranked_doc_count = db._build_snapshot(
                 [doc],
                 source_fingerprint="fingerprint-1",
                 parent_count=1,
@@ -2626,6 +2736,167 @@ class SnapshotLifecycleTests(DbTestCase):
             db.prepare_search_index()
 
         refresh_mock.assert_called_once_with(force=False)
+
+    def test_refresh_worker_builds_snapshot_and_mapped_load_preserves_results(self):
+        self._create_minimal_source_library()
+
+        return_code = db._run_refresh_worker_process()
+
+        self.assertEqual(return_code, 0)
+        snapshot_id = db._active_snapshot_id()
+        mapped_state = db._load_snapshot(snapshot_id)
+        self.assertIsNotNone(mapped_state)
+        self.assertIsNotNone(mapped_state.retriever)
+        self.assertIsInstance(mapped_state.corpus_docs, db._ThreadSafeCorpus)
+        self.assertEqual(type(mapped_state.corpus_docs._corpus).__name__, "JsonlCorpus")
+        self.assertEqual(type(mapped_state.retriever.scores["data"]).__name__, "memmap")
+
+        db._install_state(mapped_state)
+        mapped_search = json.loads(db.search("alpha beta"))
+        mapped_within = json.loads(
+            db.search_within_item("", "alpha beta", item_keys=["PARENT1"]),
+        )
+
+        bm25_dir = db._snapshots_dir() / snapshot_id / "bm25"
+        eager_retriever = bm25s.BM25.load(bm25_dir, load_corpus=True)
+        eager_state = db._SearchState(
+            snapshot_id=snapshot_id,
+            source_fingerprint=mapped_state.source_fingerprint,
+            retriever=eager_retriever,
+            corpus_docs=list(eager_retriever.corpus),
+            parents=mapped_state.parents,
+        )
+        db._install_state(eager_state)
+        eager_search = json.loads(db.search("alpha beta"))
+        eager_within = json.loads(
+            db.search_within_item("", "alpha beta", item_keys=["PARENT1"]),
+        )
+
+        self.assertEqual(mapped_search, eager_search)
+        self.assertEqual(mapped_within, eager_within)
+        self.assertEqual(mapped_search["items"][0]["key"], "PARENT1")
+        self.assertEqual(mapped_within["matches"][0]["match_type"], "metadata")
+
+        mapped_state.corpus_docs.close()
+
+    def test_thread_safe_corpus_serializes_lazy_mmap_reads(self):
+        class CursorCorpus:
+            def __init__(self):
+                self.active_reads = 0
+                self.max_active_reads = 0
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, index):
+                self.active_reads += 1
+                self.max_active_reads = max(self.max_active_reads, self.active_reads)
+                time.sleep(0.02)
+                self.active_reads -= 1
+                return {"index": index}
+
+        cursor_corpus = CursorCorpus()
+        corpus = db._ThreadSafeCorpus(cursor_corpus)
+        threads = [threading.Thread(target=lambda: corpus[0]) for _ in range(4)]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(cursor_corpus.max_active_reads, 1)
+
+    def test_build_index_background_keeps_old_state_available_until_worker_finishes(self):
+        doc = {
+            "doc_id": "meta:PARENT1",
+            "parent_key": "PARENT1",
+            "attachment_key": "",
+            "doc_kind": "metadata",
+            "chunk_index": 0,
+            "char_start": 0,
+            "char_end": 16,
+            "token_count": 2,
+            "text": "alpha beta",
+            "text_hash": "hash-doc",
+        }
+        self._install_search_state([(doc, 5.0)])
+        old_state = db._search_state
+        new_state = db._SearchState(
+            snapshot_id="snapshot-2",
+            source_fingerprint="fingerprint-2",
+            retriever=FakeRetriever([(doc, 6.0)]),
+            corpus_docs=[doc],
+            parents=old_state.parents,
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def run_worker():
+            worker_started.set()
+            release_worker.wait(timeout=2)
+            return 0
+
+        db._refresh_in_progress = True
+        with (
+            patch("zoty.db._active_snapshot_id", side_effect=["snapshot-1", "snapshot-2"]),
+            patch("zoty.db._run_refresh_worker_process", side_effect=run_worker),
+            patch("zoty.db._load_snapshot", return_value=new_state),
+            patch("zoty.db._get_item_attachment_counts", return_value={"PARENT1": 0}),
+        ):
+            refresh_thread = threading.Thread(target=db.build_index_background)
+            refresh_thread.start()
+            self.assertTrue(worker_started.wait(timeout=1))
+
+            result = json.loads(db.search("alpha"))
+            self.assertIs(db._search_state, old_state)
+            self.assertEqual(result["items"][0]["key"], "PARENT1")
+
+            release_worker.set()
+            refresh_thread.join(timeout=2)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertIs(db._search_state, new_state)
+        self.assertFalse(db._refresh_in_progress)
+
+    def test_build_index_background_keeps_old_state_when_worker_fails(self):
+        self._install_search_state([])
+        old_state = db._search_state
+        db._refresh_in_progress = True
+
+        with (
+            patch("zoty.db._active_snapshot_id", return_value="snapshot-1"),
+            patch("zoty.db._run_refresh_worker_process", return_value=-9),
+            patch("zoty.db._record_refresh_failure") as failure_mock,
+            patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            db.build_index_background()
+
+        self.assertIs(db._search_state, old_state)
+        self.assertFalse(db._refresh_in_progress)
+        failure_mock.assert_called_once_with("index refresh worker exited with status -9")
+
+    def test_build_index_background_preserves_worker_failure_details(self):
+        self._install_search_state([])
+        old_state = db._search_state
+        db._refresh_in_progress = True
+
+        with closing(db._connect_manifest(writable=True)) as conn:
+            db._initialize_manifest(conn)
+            db._set_meta(conn, "active_snapshot_id", "snapshot-1")
+            db._set_meta(conn, "last_refresh_status", "failed: worker detail")
+            conn.commit()
+
+        with (
+            patch("zoty.db._run_refresh_worker_process", return_value=1),
+            patch("zoty.db._record_refresh_failure") as failure_mock,
+            patch("sys.stderr", new_callable=io.StringIO),
+        ):
+            db.build_index_background()
+
+        self.assertIs(db._search_state, old_state)
+        self.assertFalse(db._refresh_in_progress)
+        failure_mock.assert_not_called()
 
     def test_refresh_docs_manifest_reuses_unchanged_attachment_docs(self):
         parent = self._make_parent()

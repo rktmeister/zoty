@@ -13,9 +13,10 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 import urllib.parse
 
 import bm25s
@@ -109,8 +110,28 @@ class _SearchState:
     snapshot_id: str
     source_fingerprint: str
     retriever: bm25s.BM25 | None
-    corpus_docs: list[dict[str, Any]]
+    corpus_docs: Sequence[dict[str, Any]]
     parents: dict[str, dict[str, Any]]
+
+
+class _ThreadSafeCorpus(Sequence[dict[str, Any]]):
+    """Serialize reads from bm25s's lazy corpus, which shares one mmap cursor."""
+
+    def __init__(self, corpus: Sequence[dict[str, Any]]) -> None:
+        self._corpus = corpus
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._corpus)
+
+    def __getitem__(self, index: Any) -> Any:
+        with self._lock:
+            return self._corpus[index]
+
+    def close(self) -> None:
+        close_corpus = getattr(self._corpus, "close", None)
+        if close_corpus is not None:
+            close_corpus()
 
 
 _index_lock = threading.Lock()
@@ -1593,7 +1614,7 @@ def _build_snapshot(
     source_fingerprint: str,
     parent_count: int,
     attachment_count: int,
-) -> tuple[str, bm25s.BM25 | None, list[dict[str, Any]]]:
+) -> tuple[str, int]:
     snapshot_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     snapshot_dir = _snapshots_dir() / snapshot_id
     temp_dir = _snapshots_dir() / f".{snapshot_id}.tmp"
@@ -1601,41 +1622,45 @@ def _build_snapshot(
         shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    retriever: bm25s.BM25 | None = None
-    indexed_docs: list[dict[str, Any]] = []
-    if docs:
-        token_lists = bm25s.tokenize(
-            [doc["text"] for doc in docs],
-            stopwords="en",
-            show_progress=False,
-            return_ids=False,
+    try:
+        retriever: bm25s.BM25 | None = None
+        indexed_docs: list[dict[str, Any]] = []
+        if docs:
+            token_lists = bm25s.tokenize(
+                [doc["text"] for doc in docs],
+                stopwords="en",
+                show_progress=False,
+                return_ids=False,
+            )
+            indexed_docs = [
+                doc
+                for doc, tokens in zip(docs, token_lists, strict=False)
+                if tokens
+            ]
+            indexed_tokens = [tokens for tokens in token_lists if tokens]
+            if indexed_tokens:
+                retriever = bm25s.BM25()
+                retriever.index(indexed_tokens, show_progress=False)
+                retriever.save(temp_dir / "bm25", corpus=indexed_docs)
+
+        snapshot_meta = {
+            "attachment_count": attachment_count,
+            "built_at": _now_iso(),
+            "doc_count": len(docs),
+            "parent_count": parent_count,
+            "snapshot_id": snapshot_id,
+            "source_fingerprint": source_fingerprint,
+        }
+        (temp_dir / "snapshot.json").write_text(
+            json.dumps(snapshot_meta, indent=2, sort_keys=True),
+            encoding="utf-8",
         )
-        indexed_docs = [
-            doc
-            for doc, tokens in zip(docs, token_lists, strict=False)
-            if tokens
-        ]
-        indexed_tokens = [tokens for tokens in token_lists if tokens]
-        if indexed_tokens:
-            retriever = bm25s.BM25()
-            retriever.index(indexed_tokens, show_progress=False)
-            retriever.save(temp_dir / "bm25", corpus=indexed_docs)
+        temp_dir.replace(snapshot_dir)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
-    snapshot_meta = {
-        "attachment_count": attachment_count,
-        "built_at": _now_iso(),
-        "doc_count": len(docs),
-        "parent_count": parent_count,
-        "snapshot_id": snapshot_id,
-        "source_fingerprint": source_fingerprint,
-    }
-    (temp_dir / "snapshot.json").write_text(
-        json.dumps(snapshot_meta, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temp_dir.replace(snapshot_dir)
-
-    return snapshot_id, retriever, indexed_docs
+    return snapshot_id, len(indexed_docs)
 
 
 def _load_parent_state(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -1678,16 +1703,18 @@ def _load_snapshot(snapshot_id: str) -> _SearchState | None:
         return None
 
     retriever: bm25s.BM25 | None = None
-    corpus_docs: list[dict[str, Any]] = []
+    corpus_docs: Sequence[dict[str, Any]] = ()
     bm25_dir = snapshot_dir / "bm25"
     if bm25_dir.exists():
         try:
-            retriever = bm25s.BM25.load(bm25_dir, load_corpus=True)
-            corpus_docs = list(getattr(retriever, "corpus", []))
+            retriever = bm25s.BM25.load(bm25_dir, load_corpus=True, mmap=True)
+            lazy_corpus = getattr(retriever, "corpus", None)
+            if lazy_corpus is None:
+                raise RuntimeError("snapshot is missing its saved corpus")
+            corpus_docs = _ThreadSafeCorpus(lazy_corpus)
         except Exception as exc:
             print(f"zoty: failed to load BM25 snapshot {snapshot_id}: {exc}", file=sys.stderr)
-            retriever = None
-            corpus_docs = []
+            return None
 
     try:
         with closing(_connect_manifest()) as conn:
@@ -1709,6 +1736,11 @@ def _install_state(state: _SearchState) -> None:
     global _search_state
     with _index_lock:
         _search_state = state
+
+
+def _active_snapshot_id() -> str:
+    with closing(_connect_manifest()) as conn:
+        return _get_meta(conn, "active_snapshot_id")
 
 
 def _prune_snapshots(*keep_snapshot_ids: str) -> None:
@@ -1773,6 +1805,7 @@ def prepare_search_index(*, force_refresh: bool = False) -> None:
 
 
 def _refresh_search_index_once() -> None:
+    """Build and publish one snapshot inside the refresh worker process."""
     current_fingerprint = _compute_source_fingerprint()
     parents = _fetch_parent_records()
     attachments = _fetch_attachment_records(parents)
@@ -1802,7 +1835,7 @@ def _refresh_search_index_once() -> None:
 
         _refresh_docs_manifest(conn, parents, attachments)
         docs = _load_docs_for_snapshot(conn)
-        snapshot_id, retriever, corpus_docs = _build_snapshot(
+        snapshot_id, ranked_doc_count = _build_snapshot(
             docs,
             source_fingerprint=current_fingerprint,
             parent_count=len(parents),
@@ -1814,37 +1847,85 @@ def _refresh_search_index_once() -> None:
         _set_meta(conn, "last_refresh_status", "ready")
         conn.commit()
 
-        parents_state = _load_parent_state(conn)
-
-    _install_state(_SearchState(
-        snapshot_id=snapshot_id,
-        source_fingerprint=current_fingerprint,
-        retriever=retriever,
-        corpus_docs=corpus_docs,
-        parents=parents_state,
-    ))
     _prune_snapshots(snapshot_id, previous_snapshot_id)
     print(
-        f"zoty: search index ready ({len(parents)} parents, {len(attachments)} attachments, {len(corpus_docs)} ranked docs)",
+        f"zoty: search index ready ({len(parents)} parents, {len(attachments)} attachments, {ranked_doc_count} ranked docs)",
         file=sys.stderr,
     )
 
 
-def build_index_background() -> None:
-    """Refresh the sidecar manifest and swap in a new snapshot."""
-    global _refresh_in_progress, _refresh_requested
-    rerun = False
+def _record_refresh_failure(message: str) -> None:
+    try:
+        with closing(_connect_manifest(writable=True)) as conn:
+            _initialize_manifest(conn)
+            _set_meta(conn, "last_refresh_finished_at", _now_iso())
+            _set_meta(conn, "last_refresh_status", f"failed: {message}")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _worker_recorded_refresh_failure() -> bool:
+    try:
+        with closing(_connect_manifest()) as conn:
+            return _get_meta(conn, "last_refresh_status").startswith("failed:")
+    except Exception:
+        return False
+
+
+def run_index_refresh_worker() -> int:
+    """Build and publish one index snapshot, returning a process exit code."""
     try:
         _refresh_search_index_once()
     except Exception as exc:
-        try:
-            with closing(_connect_manifest(writable=True)) as conn:
-                _initialize_manifest(conn)
-                _set_meta(conn, "last_refresh_finished_at", _now_iso())
-                _set_meta(conn, "last_refresh_status", f"failed: {exc}")
-                conn.commit()
-        except Exception:
-            pass
+        _record_refresh_failure(str(exc))
+        print(f"zoty: failed to build search index: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _refresh_worker_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "zoty._index_worker",
+        "--zotero-db",
+        str(_ZOTERO_DB),
+        "--zotero-storage",
+        str(_ZOTERO_STORAGE),
+        "--sidecar-root",
+        str(_SIDECAR_ROOT),
+    ]
+
+
+def _run_refresh_worker_process() -> int:
+    completed = subprocess.run(_refresh_worker_command(), check=False)
+    return completed.returncode
+
+
+def build_index_background() -> None:
+    """Refresh in a worker process and swap in its published snapshot."""
+    global _refresh_in_progress, _refresh_requested
+    rerun = False
+    worker_failed = False
+    try:
+        previous_snapshot_id = _active_snapshot_id()
+        return_code = _run_refresh_worker_process()
+        if return_code != 0:
+            worker_failed = True
+            raise RuntimeError(f"index refresh worker exited with status {return_code}")
+
+        snapshot_id = _active_snapshot_id()
+        if not snapshot_id or snapshot_id == previous_snapshot_id:
+            raise RuntimeError("index refresh worker did not publish a new snapshot")
+
+        state = _load_snapshot(snapshot_id)
+        if state is None:
+            raise RuntimeError(f"failed to load published snapshot {snapshot_id}")
+        _install_state(state)
+    except Exception as exc:
+        if not worker_failed or not _worker_recorded_refresh_failure():
+            _record_refresh_failure(str(exc))
         print(f"zoty: failed to build search index: {exc}", file=sys.stderr)
     finally:
         with _index_lock:
